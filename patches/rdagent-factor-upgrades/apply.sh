@@ -10,7 +10,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH="$HERE/quantlab-rdagent-factor-upgrades.patch"
-PATCH_SHA256="af2dc29725a619dd44c1d952e5e101cccb016abcbdac3b46ba8f80801c9cd19c"
+PATCH_SHA256="bfa6a5abd74dcc6a8885338b57fd9b6f0408956076ebc82201c8256be966bb99"
 UPSTREAM_URL="https://github.com/microsoft/RD-Agent.git"
 UPSTREAM_TAG="v1.0.0"
 

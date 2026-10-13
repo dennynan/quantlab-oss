@@ -107,7 +107,7 @@ index 13dade7..df644c5 100644
  class FactorFromReportPropSetting(FactorBasePropSetting):
      # 1) override the scen attribute
 diff --git a/rdagent/app/qlib_rd_loop/factor.py b/rdagent/app/qlib_rd_loop/factor.py
-index 7f7736a..d8d918c 100644
+index 7f7736a..d8d918c 100755
 --- a/rdagent/app/qlib_rd_loop/factor.py
 +++ b/rdagent/app/qlib_rd_loop/factor.py
 @@ -14,6 +14,9 @@ from rdagent.core.exception import CoderError, FactorEmptyError
@@ -1679,7 +1679,7 @@ index 0000000..3b5ee09
 +    )
 +    return report
 diff --git a/rdagent/scenarios/qlib/experiment/factor_data_template/README.md b/rdagent/scenarios/qlib/experiment/factor_data_template/README.md
-index d03534d..4f3e636 100644
+index d03534d..4f3e636 100755
 --- a/rdagent/scenarios/qlib/experiment/factor_data_template/README.md
 +++ b/rdagent/scenarios/qlib/experiment/factor_data_template/README.md
 @@ -10,7 +10,7 @@ NOTE: **key is always "data" for all hdf5 files **.
@@ -1703,7 +1703,7 @@ index d03534d..4f3e636 100644
 +> reference fundamental fields (e.g. ROE, margins, growth, per-share, solvency or turnover
 +> ratios) — those columns do not exist in the data and such factors will fail.
 diff --git a/rdagent/scenarios/qlib/experiment/factor_data_template/generate.py b/rdagent/scenarios/qlib/experiment/factor_data_template/generate.py
-index f05aee5..aac8e9b 100644
+index f05aee5..aac8e9b 100755
 --- a/rdagent/scenarios/qlib/experiment/factor_data_template/generate.py
 +++ b/rdagent/scenarios/qlib/experiment/factor_data_template/generate.py
 @@ -1,13 +1,55 @@
