@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装依赖（不含重型 qlib，仅做 import 冒烟）
+        run: |
+          python -m pip install -U pip
+          pip install fastapi uvicorn pydantic sqlalchemy pandas numpy requests json5 python-multipart
+      - name: 生成样例数据
+        run: python examples/make_sample_data.py
+      - name: 后端 import 冒烟
+        run: |
+          cd backend
+          python -c "import main; print('backend import OK')"
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: 安装并构建
+        run: |
+          cd frontend
+          npm install
+          npm run build

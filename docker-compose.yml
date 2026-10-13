@@ -1,0 +1,31 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: quantlab-oss-backend
+    ports:
+      - "5001:5001"
+    environment:
+      - PORT=5001
+      # 按需注入（留空则 AI 功能优雅降级）
+      - QUANTLAB_LLM_API_KEY=${QUANTLAB_LLM_API_KEY:-}
+      - QUANTLAB_LLM_BASE_URL=${QUANTLAB_LLM_BASE_URL:-https://api.deepseek.com}
+      - QUANTLAB_LLM_MODEL=${QUANTLAB_LLM_MODEL:-deepseek-chat}
+      - QLIB_DATA_DIR=/app/qlib_data
+    volumes:
+      # 挂载样例/自有数据（首次可用 make sample-data 生成）
+      - ./data:/app/data
+      - ./qlib_data:/app/qlib_data
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    container_name: quantlab-oss-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

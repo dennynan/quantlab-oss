@@ -1,0 +1,39 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 前端 ──
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+yarn-error.log*
+
+# ── 密钥 / 环境 ──
+.env
+.env.local
+*.env
+!.env.example
+
+# ── 数据 / 产物（不入库，用 examples/make_sample_data.py 生成）──
+data/
+qlib_data/
+*.db
+*.duckdb
+*.h5
+*.pkl
+*.log
+logs/
+
+# ── 系统 ──
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
