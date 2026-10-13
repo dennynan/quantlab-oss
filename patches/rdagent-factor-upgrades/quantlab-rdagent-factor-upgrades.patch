@@ -1,0 +1,2458 @@
+diff --git a/rdagent/app/qlib_rd_loop/conf.py b/rdagent/app/qlib_rd_loop/conf.py
+index 13dade7..df644c5 100644
+--- a/rdagent/app/qlib_rd_loop/conf.py
++++ b/rdagent/app/qlib_rd_loop/conf.py
+@@ -83,15 +83,100 @@ class FactorBasePropSetting(BasePropSetting):
+     valid_start: str = "2015-01-01"
+     """Start date of the validation segment"""
+ 
+-    valid_end: str = "2016-12-31"
++    valid_end: str = "2017-12-31"
+     """End date of the validation segment"""
+ 
+-    test_start: str = "2017-01-01"
++    test_start: str = "2018-01-01"
+     """Start date of the test / backtest segment"""
+ 
+-    test_end: Optional[str] = "2020-08-01"
++    test_end: Optional[str] = "2025-12-30"
+     """End date of the test / backtest segment"""
+ 
++    # === B4/B5：因子池重选 + 相关性剪枝（2026-09-19）===
++    # 原逻辑把「历史全部因子 ∪ 本轮新因子」直接回测，池子只增不减、同族冗余堆积，
++    # 导致第一轮组合即被锁死、新因子无法替换。这里在拼池后按 |RankIC| 重选并去重。
++    factor_select_enable: bool = True
++    """是否启用因子池重选（runner 拼池后、写 parquet 前）"""
++
++    factor_select_topk: int = 20
++    """重选后最多保留的因子个数（库成员占种子名额，其余给新因子）。
++    2026-09-24：由 10 提到 14 —— 库成员 9 个 + 新因子必须留出空位才能“替换”，
++    否则 topk=10 时只剩 1 个名额，新因子永远进不来（质量已由残差 IC/相关/同族上限把住）。
++    2026-09-25：由 14 提到 20（主人拍板）—— 进一步放宽新因子名额；
++    质量门（resid_t≥2、|ρ|<0.8、同族窗口≤2）不变，所以放宽的是“能进来几个”而不是“什么都能进来”。"""
++
++    factor_select_corr_max: float = 0.8
++    """与已选因子的横截面秩相关超过该阈值则剪枝（同族去冗余）"""
++
++    factor_select_min_abs_ic: float = 0.0
++    """|RankIC| 低于该阈值的因子直接淘汰（0 = 不设门槛）"""
++
++    factor_select_min_icir_tstat: float = 2.0
++    """统计显著性门槛：|ICIR|·√days 低于该值视为噪声因子淘汰（2.0 ≈ 95% 置信）"""
++
++    # === 因子规整规则（2026-09-24）===
++    factor_min_window: int = 5
++    """LLM 提案因子的最短回看窗口（交易日）。窗口 < 该值的因子在提案层被过滤并自动重提
++    （0 = 关闭该规则）。可用环境变量 RDAGENT_MIN_FACTOR_WINDOW 临时覆盖（优先于本项）。"""
++
++    factor_select_min_window: int = 0
++    """因子池重选时的兜底最小窗口过滤（交易日，0 = 关闭）。默认关闭：池里可能含历史会话
++    继承下来的旧因子（如 overnight_gap_1d），开启会连带把它们一起剔掉，改变既有 SOTA 口径。"""
++
++    factor_select_source_path: Optional[str] = None
++    """daily_pv.h5 路径，None 则自动探测（也可用环境变量 RDAGENT_DAILY_PV）"""
++
++    factor_select_close_col: str = "$close"
++    """价格列名，label 口径 Ref($close,-2)/Ref($close,-1)-1 由此列计算"""
++
++    # === B6/B7/B8/B9：残差 IC 主判据 + 判重归一 + 正交化 + 同族窗口上限（2026-09-24）===
++    # 依据 QuantLab/data/rdagent/factor_redundancy_report.md 的实证：近 10 轮 gate 全不通过、
++    # "IC 略升但年化/Calmar 恶化"，根因是判据看不出增量（原始 IC 与残差 IC 常反向）。
++    factor_select_rank_by: str = "raw_ic"
++    """选择排序口径："raw_ic"（默认）| "resid_ic"（残差口径，**暂不推荐**）。
++    可用 RDAGENT_FACTOR_RANK_BY 覆盖。
++
++    2026-09-25 由 resid_ic 改回 raw_ic（09-24 设成 resid_ic 的实测翻车）：
++    残差口径把新因子准入判据换成「对已选集合正交化后的残差 IC，t≥2」（见下方
++    factor_select_resid_tstat_min）。但真实挖掘的候选都是**同族变体**，去掉已有因子信息后
++    残差≈0 → 残差 t 常年在 0~1.7 → 新因子**全军覆没**：
++      · 09-25 job 103550（全新会话、库为空）：3 个候选只有 1 个过 → "只有一个因子"
++      · 09-25 job 104411/105644：6 个新因子 0 通过（原始 t 高达 10.59 / 8.73 / 6.92 的
++        强因子全被否）→ 池子冻结在 3 个 → Calmar 卡 0.2144、Replace Best 永远 no
++    而旧稳定口径（raw_ic + 原始 t≥2）下这些因子全都够格进池 —— 正是靠它，上一个会话才
++    能 33 圈增长到 9 因子 / Calmar 0.7261。
++    **保留的能力**：raw_ic 只改「排序/准入判据」；相关性剪枝（B5/B7）、同族窗口上限（B9）、
++    入库前正交化（B8）全部照旧生效，最终由组合回测（Calmar / Replace Best）裁决。
++    复核脚本：QuantLab/scripts/factor_select_smallpool_check.py（真实小池子三口径对比）"""
++
++    factor_select_resid_tstat_min: float = 2.0
++    """残差 IC 的 t 统计量门槛（**仅 rank_by="resid_ic" 时生效**，2.0 ≈ 95% 置信）。
++    注意：rank_by 现默认 raw_ic → 此项默认不参与准入（新因子回落用原始
++    |ICIR|·√days ≥ factor_select_min_icir_tstat）。若要重启残差口径，先做小池子复核。
++    可用 RDAGENT_FACTOR_RESID_TSTAT_MIN 覆盖。"""
++
++    factor_select_orthogonalize: bool = True
++    """是否把新因子（非 SOTA 库成员）在入库前对库做截面正交化（B8）。
++    可用 RDAGENT_FACTOR_ORTHOGONALIZE=0 关闭。"""
++
++    factor_select_family_window_max: int = 2
++    """同族（名归一去窗口）最多保留的窗口数（B9，0 = 关闭）。
++    可用 RDAGENT_FACTOR_FAMILY_WINDOW_MAX 覆盖。"""
++
++    factor_select_dup_corr: float = 0.95
++    """同族且 |秩相关| ≥ 该值 → 判重（B7；ρ≈-1 记为 sign_flip_of）。"""
++
++    factor_restart_enable: bool = False
++    """B6 停滞自动重启开关（连续 patience 轮 Replace Best=no → 清空 SOTA 基线）。
++
++    2026-09-20 因触发回归而默认关闭：清空 decision 会把 Replace 判定基线从「会话最优」
++    退化成「种子基线」（rd_20260920_151207 / Loop_8：Calmar 0.102 覆盖了 0.525）。
++    真实停滞场景未验证前保持 OFF；需要时用 RDAGENT_FACTOR_RESTART=1 显式打开。
++    """
++
++    factor_restart_patience: int = 3
++    """B6 触发阈值：连续多少轮 no-replace 后重启；同时也是两次重启之间的最小间隔"""
++
+ 
+ class FactorFromReportPropSetting(FactorBasePropSetting):
+     # 1) override the scen attribute
+diff --git a/rdagent/app/qlib_rd_loop/factor.py b/rdagent/app/qlib_rd_loop/factor.py
+index 7f7736a..d8d918c 100644
+--- a/rdagent/app/qlib_rd_loop/factor.py
++++ b/rdagent/app/qlib_rd_loop/factor.py
+@@ -14,6 +14,9 @@ from rdagent.core.exception import CoderError, FactorEmptyError
+ from rdagent.log import rdagent_logger as logger
+ 
+ 
++from rdagent.scenarios.qlib.developer.stagnation_restart import maybe_restart_on_stagnation
++
++
+ class FactorRDLoop(RDLoop):
+     skip_loop_error = (FactorEmptyError, CoderError)
+     skip_loop_error_stepname = "feedback"
+@@ -26,6 +29,23 @@ class FactorRDLoop(RDLoop):
+         logger.log_object(exp, tag="runner result")
+         return exp
+ 
++    def record(self, prev_out: dict[str, Any]):
++        # 2026-09-25 修：record 失败不能带走整个进程（本会话第 34 圈就是这么崩的）。
++        # 兜底记一条 warning，继续走 B6 停滞检查。
++        try:
++            super().record(prev_out)
++        except Exception as e:  # pragma: no cover - 兜底
++            logger.warning(f"[record] DAG 同步失败，不打断 loop：{type(e).__name__}: {e}")
++        # B6：停滞自动重启 —— 连续 patience 轮 Replace Best=no 时清空 SOTA 基线，让 loop 重新出发。
++        # 任何异常都不打断 loop。
++        try:
++            maybe_restart_on_stagnation(
++                self.trace,
++                loop_idx=prev_out.get(self.LOOP_IDX_KEY),
++            )
++        except Exception as e:  # pragma: no cover - 兜底
++            logger.warning(f"[stagnation-restart] 检查跳过（异常）：{e}")
++
+ 
+ def main(
+     path: Optional[str] = None,
+diff --git a/rdagent/components/coder/factor_coder/config.py b/rdagent/components/coder/factor_coder/config.py
+index a09ae66..190ae82 100644
+--- a/rdagent/components/coder/factor_coder/config.py
++++ b/rdagent/components/coder/factor_coder/config.py
+@@ -19,8 +19,27 @@ class FactorCoSTEERSettings(CoSTEERSettings):
+     simple_background: bool = False
+     """Whether to use simple background information for code feedback"""
+ 
+-    file_based_execution_timeout: int = 3600
+-    """Timeout in seconds for each factor implementation execution"""
++    file_based_execution_timeout: int = 600
++    """Timeout in seconds for each factor implementation execution（硬阈值：超时即判该因子失败）
++
++    演进：3600（1 小时）-> 2026-09-12 下调为 900（15 分钟）-> 2026-09-24 下调为 600。
++
++    2026-09-24 的实测依据（daily_pv.h5 = 1374 万行 x 6 列，2008-2025，5398 只）：
++    - 常规向量化因子：0.2 ~ 5 s（MOM_5D 0.8s / CLV_20D 1.2s / VOL_20D 2.5s / VWAP_DEV_20D 4.8s ...）
++    - 最慢的**合法**因子：DOWNCCORR_60D 123 s（当时仍在 SOTA 池里）
++    - 病态因子：DOWNBETA_60D（O(n^2) 逐日循环）> 900 s，真跑 rd_20260924_125208 于 13:09:45
++      被旧 900s 阈值杀掉，**单轮白等 17 分钟**（全轮 19.7 分钟）
++    600 s = 相对最慢合法因子 4.9x 余量，同时把病态因子的时间浪费砍掉 1/3。
++    如需临时调整，用环境变量 FACTOR_CoSTEER_file_based_execution_timeout 覆盖。
++    """
++
++    factor_soft_timeout_sec: int = 30
++    """Soft threshold（秒）：单因子计算超过它**只告警不判失败**，用于尽早暴露「取巧型慢因子」。
++
++    实测常规因子 0.2~5s，条件相关/条件 beta 类 123s 起。设 30s 可以把异常写法在日志里捞出来，
++    又不误杀已知合法因子（123s）。超硬阈值（file_based_execution_timeout）才判失败。
++    覆盖：FACTOR_CoSTEER_factor_soft_timeout_sec
++    """
+ 
+     select_method: str = "random"
+     """Method for the selection of factors implementation"""
+diff --git a/rdagent/components/coder/factor_coder/factor.py b/rdagent/components/coder/factor_coder/factor.py
+index 398e966..bc03923 100644
+--- a/rdagent/components/coder/factor_coder/factor.py
++++ b/rdagent/components/coder/factor_coder/factor.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import subprocess
++import time
+ import uuid
+ from pathlib import Path
+ from typing import Tuple, Union
+@@ -14,6 +15,7 @@ from rdagent.components.coder.factor_coder.config import FACTOR_COSTEER_SETTINGS
+ from rdagent.core.exception import CodeFormatError, CustomRuntimeError, NoOutputError
+ from rdagent.core.experiment import Experiment, FBWorkspace
+ from rdagent.core.utils import cache_with_pickle
++from rdagent.log import rdagent_logger as logger
+ from rdagent.oai.llm_utils import md5_hash
+ 
+ 
+@@ -159,6 +161,7 @@ class FactorFBWorkspace(FBWorkspace):
+                 execution_code_path = self.workspace_path / f"{uuid.uuid4()}.py"
+                 execution_code_path.write_text((Path(__file__).parent / "factor_execution_template.txt").read_text())
+ 
++            _compute_start = time.time()
+             try:
+                 subprocess.check_output(
+                     f"{FACTOR_COSTEER_SETTINGS.python_bin} {execution_code_path}",
+@@ -185,13 +188,24 @@ class FactorFBWorkspace(FBWorkspace):
+                 else:
+                     execution_error = CustomRuntimeError(execution_feedback)
+             except subprocess.TimeoutExpired:
+-                execution_feedback += f"Execution timeout error and the timeout is set to {FACTOR_COSTEER_SETTINGS.file_based_execution_timeout} seconds."
++                execution_feedback = f"Execution timeout error and the timeout is set to {FACTOR_COSTEER_SETTINGS.file_based_execution_timeout} seconds."
+                 if self.raise_exception:
+                     raise CustomRuntimeError(execution_feedback)
+                 else:
+                     execution_error = CustomRuntimeError(execution_feedback)
+ 
+             workspace_output_file_path = self.workspace_path / "result.h5"
++            # 2026-09-24：软阈值告警（不判失败）。现象：常规因子 0.2~5s，逐日循环写法 123s ~ >900s。
++            # 硬阈值（file_based_execution_timeout）只负责止损，本处告警用于把「取巧型慢因子」尽早暴露。
++            _compute_elapsed = time.time() - _compute_start
++            if _compute_elapsed >= FACTOR_COSTEER_SETTINGS.factor_soft_timeout_sec:
++                logger.warning(
++                    f"[factor-time] single factor computation took {_compute_elapsed:.1f}s, "
++                    f"over the soft threshold {FACTOR_COSTEER_SETTINGS.factor_soft_timeout_sec}s "
++                    f"(hard limit {FACTOR_COSTEER_SETTINGS.file_based_execution_timeout}s). "
++                    f"Vectorize it (groupby cumsum/rolling or masked-matrix moments) instead of "
++                    f"day-by-day python loops."
++                )
+             if workspace_output_file_path.exists() and execution_success:
+                 try:
+                     executed_factor_value_dataframe = pd.read_hdf(workspace_output_file_path)
+diff --git a/rdagent/components/proposal/__init__.py b/rdagent/components/proposal/__init__.py
+index dec620d..5367af7 100644
+--- a/rdagent/components/proposal/__init__.py
++++ b/rdagent/components/proposal/__init__.py
+@@ -1,6 +1,8 @@
++import os
+ from abc import abstractmethod
+ from typing import Tuple
+ 
++from rdagent.core.exception import FactorEmptyError
+ from rdagent.core.experiment import Experiment
+ from rdagent.core.proposal import (
+     ExperimentPlan,
+@@ -11,9 +13,36 @@ from rdagent.core.proposal import (
+     Trace,
+ )
+ from rdagent.oai.llm_utils import APIBackend
++from rdagent.oai.retry_temp import clear_retry_temperature_boost, set_retry_temperature_boost
+ from rdagent.utils.agent.tpl import T
+ from rdagent.utils.workflow import wait_retry
+ 
++# ── 重试升温（2026-10-09，C 方案）───────────────────────────────────────────
++# 提案被去重/窗口规则拒绝时（FactorEmptyError），wait_retry 会用**同一个 prompt** 重跑，
++# 低温度下 LLM 会复读同一个因子名连撞 6 次 → 空圈、零产物。这里按重试次数抬温。
++# 可用环境变量覆盖：RDAGENT_RETRY_TEMP_STEP（每次增量，默认 0.2）、
++# RDAGENT_RETRY_TEMP_CAP（温度上限，默认 0.9）。
++RETRY_TEMP_STEP = 0.2
++RETRY_TEMP_CAP = 0.9
++
++
++def _retry_temp_step() -> float:
++    try:
++        return max(0.0, float(os.environ.get("RDAGENT_RETRY_TEMP_STEP", RETRY_TEMP_STEP)))
++    except (TypeError, ValueError):
++        return RETRY_TEMP_STEP
++
++
++def _bump_retry_temperature(attempt: int, exc: Exception) -> None:
++    """重试前的升温回调：仅对「提案被拒」类错误生效，API 瞬时报错不动温度。"""
++    if isinstance(exc, FactorEmptyError):
++        try:
++            cap = float(os.environ.get("RDAGENT_RETRY_TEMP_CAP", RETRY_TEMP_CAP))
++        except (TypeError, ValueError):
++            cap = RETRY_TEMP_CAP
++        # 增量按次递增；最终温度 = min(cap, chat_temperature + delta)，封顶由后端处理。
++        set_retry_temperature_boost(min(cap, _retry_temp_step() * attempt))
++
+ 
+ class LLMHypothesisGen(HypothesisGen):
+     def __init__(self, scen: Scenario):
+@@ -90,7 +119,11 @@ class LLMHypothesis2Experiment(Hypothesis2Experiment[Experiment]):
+     @abstractmethod
+     def convert_response(self, response: str, hypothesis: Hypothesis, trace: Trace) -> Experiment: ...
+ 
+-    @wait_retry(retry_n=5)
++    @wait_retry(
++        retry_n=5,
++        on_retry=_bump_retry_temperature,
++        on_finish=clear_retry_temperature_boost,
++    )
+     def convert(self, hypothesis: Hypothesis, trace: Trace) -> Experiment:
+         context, json_flag = self.prepare_context(hypothesis, trace)
+         system_prompt = T(".prompts:hypothesis2experiment.system_prompt").r(
+diff --git a/rdagent/components/workflow/rd_loop.py b/rdagent/components/workflow/rd_loop.py
+index f93c51f..3c472a0 100644
+--- a/rdagent/components/workflow/rd_loop.py
++++ b/rdagent/components/workflow/rd_loop.py
+@@ -237,5 +237,14 @@ class RDLoop(LoopBase, metaclass=LoopMeta):
+ 
+     def record(self, prev_out: dict[str, Any]):
+         feedback = prev_out["feedback"]
+-        exp = prev_out.get("running") or prev_out.get("coding") or prev_out.get("direct_exp_gen", {}).get("exp_gen")
++        # 2026-09-25 修：direct_exp_gen 被跳过时会被置为 None（提案全被去重规则剔除 → FactorEmptyError），
++        # 旧写法 `prev_out.get("direct_exp_gen", {}).get(...)` 会对 None 调 .get → AttributeError 崩掉整个进程。
++        exp = prev_out.get("running") or prev_out.get("coding") or (prev_out.get("direct_exp_gen") or {}).get("exp_gen")
++        if exp is None:
++            # 2026-09-27 修：跳圈（提案全被去重剔除 → FactorEmptyError）后 exp 为 None。
++            # 若照旧把 None 写进 trace.hist，会污染历史 —— 下一轮渲染 `{{ experiment.hypothesis }}`
++            # 时 UndefinedError 崩掉（2026-09-25 第 34 圈事件）。此处跳过 DAG/hist 同步，
++            # dag_parent 与 hist 保持等长，历史只保留真实实验。
++            logger.warning("[record] 本轮实验为空（跳圈），跳过 DAG/hist 同步，不入历史。")
++            return
+         self.trace.sync_dag_parent_and_hist((exp, feedback), prev_out[self.LOOP_IDX_KEY])
+diff --git a/rdagent/oai/backend/litellm.py b/rdagent/oai/backend/litellm.py
+index 86cbe84..e8f453c 100644
+--- a/rdagent/oai/backend/litellm.py
++++ b/rdagent/oai/backend/litellm.py
+@@ -18,6 +18,7 @@ from rdagent.log import LogColors
+ from rdagent.log import rdagent_logger as logger
+ from rdagent.oai.backend.base import APIBackend
+ from rdagent.oai.llm_conf import LLMSettings
++from rdagent.oai.retry_temp import get_retry_temperature_boost
+ 
+ 
+ # NOTE: Patching! Otherwise, the exception will call the constructor and with following error:
+@@ -71,6 +72,11 @@ class LiteLLMAPIBackend(APIBackend):
+     def _create_embedding_inner_function(self, input_content_list: list[str]) -> list[list[float]]:
+         """
+         Call the embedding function
++
++        NOTE: some embedding providers cap the number of inputs per request
++        (e.g. DashScope's text-embedding models reject batches larger than 20),
++        so the input list is split into batches of `embedding_max_str_num` items
++        and the embeddings are concatenated afterwards.
+         """
+         model_name = LITELLM_SETTINGS.embedding_model
+         logger.info(f"{LogColors.GREEN}Using emb model{LogColors.END} {model_name}", tag="debug_litellm_emb")
+@@ -79,11 +85,14 @@ class LiteLLMAPIBackend(APIBackend):
+                 f"{LogColors.MAGENTA}Creating embedding{LogColors.END} for: {input_content_list}",
+                 tag="debug_litellm_emb",
+             )
+-        response = embedding(
+-            model=model_name,
+-            input=input_content_list,
+-        )
+-        response_list = [data["embedding"] for data in response.data]
++        batch_size = max(1, LITELLM_SETTINGS.embedding_max_str_num)
++        response_list: list[list[float]] = []
++        for start in range(0, len(input_content_list), batch_size):
++            response = embedding(
++                model=model_name,
++                input=input_content_list[start : start + batch_size],
++            )
++            response_list.extend([data["embedding"] for data in response.data])
+         return response_list
+ 
+     class CompleteKwargs(TypedDict):
+@@ -117,6 +126,16 @@ class LiteLLMAPIBackend(APIBackend):
+                         else:
+                             reasoning_effort = None
+                     break
++
++        # 重试升温（2026-10-09）：撞名/空提案重试时按次抬温，打破同 prompt 下的确定性复读。
++        # 默认增量为 0，行为与改造前一致；增量由 wait_retry(on_retry=...) 设置、on_finish 清除。
++        boost = get_retry_temperature_boost()
++        if boost > 0:
++            temperature = min(1.0, temperature + boost)
++            logger.info(
++                f"{LogColors.YELLOW}[retry-temp] 重试升温 → temperature={temperature:.2f} (base+{boost:.2f}){LogColors.END}"
++            )
++
+         return self.CompleteKwargs(
+             model=model,
+             temperature=temperature,
+diff --git a/rdagent/oai/retry_temp.py b/rdagent/oai/retry_temp.py
+new file mode 100644
+index 0000000..cb09d5f
+--- /dev/null
++++ b/rdagent/oai/retry_temp.py
+@@ -0,0 +1,43 @@
++"""重试升温（retry temperature boost）。
++
++背景（2026-10-09）：
++`LLMHypothesis2Experiment.convert` 上的 `@wait_retry(retry_n=5)` 是用**完全相同的
++prompt** 重跑（没有 feedback、没有 transform_args_fn）。当提案因「与历史重复 / 回看窗口
++过短」被拒时，低温度（chat_temperature=0.2）下 LLM 会近乎确定性地复读同一个名字，
++连续 6 次撞同一堵墙 → 空圈跳圈 → 零产物（见 rd_20261009_181951 / Loop 41 Skip）。
++
++这里提供一个**线程级**（RD-Agent 的调用链是同步的，同线程）临时温度增量：
++重试前 set，重试结束/成功返回时 clear；LLM 后端在拼请求参数时把增量加到
++chat_temperature 上，让第 2 次起的采样真正发散。
++
++不发散时（默认 delta=0）行为与改造前完全一致。
++"""
++
++from __future__ import annotations
++
++import threading
++
++_local = threading.local()
++
++
++def set_retry_temperature_boost(delta: float) -> None:
++    """给当前线程设置 chat_temperature 增量（正数=升温；<=0 等价于清除）。"""
++    value = float(delta)
++    if value <= 0:
++        clear_retry_temperature_boost()
++        return
++    _local.delta = value
++
++
++def clear_retry_temperature_boost() -> None:
++    """清除当前线程的温度增量。
++
++    必须在重试链结束（成功返回或最终抛错）时调用，避免增量泄漏到后续无关的 LLM 请求。
++    """
++    if hasattr(_local, "delta"):
++        del _local.delta
++
++
++def get_retry_temperature_boost() -> float:
++    """读取当前线程的温度增量，默认 0.0。"""
++    return float(getattr(_local, "delta", 0.0) or 0.0)
+diff --git a/rdagent/scenarios/qlib/developer/factor_runner.py b/rdagent/scenarios/qlib/developer/factor_runner.py
+index c6b58d3..5a8eec9 100644
+--- a/rdagent/scenarios/qlib/developer/factor_runner.py
++++ b/rdagent/scenarios/qlib/developer/factor_runner.py
+@@ -12,6 +12,7 @@ from rdagent.app.qlib_rd_loop.conf import FactorBasePropSetting
+ from rdagent.components.runner import CachedRunner
+ from rdagent.core.exception import FactorEmptyError
+ from rdagent.log import rdagent_logger as logger
++from rdagent.scenarios.qlib.developer.factor_selector import select_combined_factors
+ from rdagent.scenarios.qlib.developer.utils import process_factor_data
+ from rdagent.scenarios.qlib.experiment.factor_experiment import QlibFactorExperiment
+ from rdagent.scenarios.qlib.experiment.model_experiment import QlibModelExperiment
+@@ -109,8 +110,23 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
+                         "The factors generated in this round are highly similar to the previous factors. Please change the direction for creating new factors."
+                     )
+                 combined_factors = pd.concat([SOTA_factor, new_factors], axis=1).dropna()
++                # B4/B5：历史全部因子 ∪ 新因子会被无上限地拼进来，这里按 |RankIC| 重选 + 秩相关剪枝，
++                # 让弱因子/同族冗余因子退出，新因子才有机会替换旧组合。
++                # 传 sota_n：拼接顺序保证前 sota_n 列是既有库 → B8 正交化只作用于新因子。
++                combined_factors = select_combined_factors(
++                    combined_factors,
++                    workspace=exp.experiment_workspace.workspace_path,
++                    setting=fbps,
++                    sota_n=len(SOTA_factor.columns),
++                )
+             else:
+                 combined_factors = new_factors
++                # 无 SOTA 时的第一轮路径（含 fin_factor 首次运行）：同样走一遍选择，截断 topk + 同族剪枝
++                combined_factors = select_combined_factors(
++                    combined_factors,
++                    workspace=exp.experiment_workspace.workspace_path,
++                    setting=fbps,
++                )
+ 
+             # Sort and nest the combined factors under 'feature'
+             combined_factors = combined_factors.sort_index()
+@@ -174,6 +190,12 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
+             logger.info(f"Experiment execution ...")
+             if exp.base_feature_codes:
+                 factors = process_factor_data(exp)
++                # 首轮（无历史因子）也走一遍选择：截断 topk + 同族剪枝
++                factors = select_combined_factors(
++                    factors,
++                    workspace=exp.experiment_workspace.workspace_path,
++                    setting=fbps,
++                )
+                 factors = factors.sort_index()
+                 factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
+                 new_columns = pd.MultiIndex.from_product([["feature"], factors.columns])
+diff --git a/rdagent/scenarios/qlib/developer/factor_selector.py b/rdagent/scenarios/qlib/developer/factor_selector.py
+new file mode 100644
+index 0000000..b690315
+--- /dev/null
++++ b/rdagent/scenarios/qlib/developer/factor_selector.py
+@@ -0,0 +1,883 @@
++"""因子池重选 + 相关性剪枝 + 正交化（B4 / B5 / B6 / B7 / B8）
++
++背景（2026-09-19 定位到的设计缺陷）
++----------------------------------
++原 `QlibFactorRunner.develop` 直接拼历史全部因子 + 本轮新因子：
++
++    SOTA_factor  = process_factor_data(全部历史因子实验)   # 只增不减
++    combined     = pd.concat([SOTA_factor, new_factors], axis=1).dropna()
++
++后果：
++1. 因子池单调膨胀，早期弱因子永久占位 —— SOTA 组合第一轮就被锁死（实测 9/12~9/16
++   连续约 20 次运行 active_factors 一字未变），新因子只能「陪跑」无法替换；
++2. 同族因子（如 reversal_5d / reversal_5d_vol_scaled / reversal_5d_vol_scaled_20d）
++   高度相关却全部入池，组合上限被同族冗余占满，过拟合加重、Replace Best 更难通过。
++
++本模块在 concat 之后、写 `combined_factors_df.parquet` 之前插入一层**确定性**筛选：
++
++  B4 重选：对候选池按 |RankIC| 降序做贪心前向选择，至多保留 topk 个 → 弱因子被淘汰
++         （并设统计显著性门槛 |ICIR|·√days ≥ min_icir_tstat，杜绝噪声因子占位）
++  B5 剪枝：与已选因子横截面秩相关 > corr_max 的候选直接跳过 → 同族去冗余
++
++2026-09-24 扩展（小潘，依据 `QuantLab/data/rdagent/factor_redundancy_report.md` 的实证）
++--------------------------------------------------------------------------------------
++实证结论：近 10 轮 gate 全部不通过、且「Rank IC 略升但年化/Calmar 恶化」；原因不是
++「因子太多」，而是**判据看不出增量**：
++
++  * 少数因子对已有库高冗余：VW_DOWNSIDE_VOL_20D 对 DOWNSIDE_VOL_20D ρ=0.953/R²=0.927；
++    VW_MOMENTUM_20D 对 MOM_20D ρ=0.875；VW_REVERSAL_20D 对 MOM_20D ρ=0.868。
++  * **成对白跑**：VW_OVERNIGHT_MOMENTUM_20D × VW_OVERNIGHT_REVERSAL_20D 逐日截面
++    Spearman ρ = **-1.000**（同一因子取了负号）；MOMENTUM × REVERSAL ρ=-0.969。
++  * **原始 IC 与残差 IC 常反向**：VW_HIGH_LOW_RANGE_ASYM_RATIO_5D 原始 IC -0.0092 而残差
++    IC +0.0375（很有增量）；VW_MOMENTUM_20D 原始 IC -0.0516 而残差 IC +0.0038（≈纯冗余）。
++    ⇒ 用原始 IC 排序会**同时**放过高冗余的、砍掉正交的。
++
++因此新增：
++
++  B6 残差 IC 判据（`rank_by="resid_ic"`，**2026-09-25 起不再默认**）：候选对**已选集合**逐日
++     截面 z-score 后做 OLS 取残差，用残差算 Rank IC —— 只有「库里没有的信息」才算数；
++     并用残差 IC 的 t 统计量（`resid_tstat_min`）代替原始 ICIR 门槛。
++     实测翻车：真实候选都是同族变体 → 残差 t 极低 → 新因子全被否 → 池子冻结，故默认改回
++     `raw_ic`（见 DEFAULT_RANK_BY 处注释与 QuantLab/scripts/factor_select_smallpool_check.py）。
++  B7 判重/归一（`dedup`，默认开）：因子名归一化（`momentum`/`reversal` 视为同族、
++     `asymmetry_ratio`→`asymmetry`、剥离窗口后缀），同族且 |ρ| ≥ `dup_corr` 的候选判重，
++     只留残差 IC 高者，报告里标注 `duplicate_of` / `sign_flip_of`（ρ≈-1）。
++  B8 候选入库前正交化（`orthogonalize`，默认开）：新因子**对库**做截面正交化后再进组合，
++     从机制上消除「重复投票」（系数在抽样面板上估计，逐日截面 z-score ⇒ 只用当日信息，
++     无未来函数）。
++  B9 同族窗口上限（`family_window_max`，默认 2）：同一族最多保留 N 个窗口，避免
++     5/10/20/60D 同族堆叠（窗口间 ρ 实测 0.71~0.75）。
++
++2026-09-25 补丁（小潘）：B8 的**代价补偿**——正交化后写进 parquet 的是**残差**，
++因子值不再是「原义」（单因子可解释性、跨轮可比性、下游复用、归因都会受影响）。因此
++`select_combined_factors(workspace=...)` 在落盘时**额外**写两个文件（仅当本轮真的正交化过）：
++
++  * `combined_factors_raw.parquet`：选中列的**正交化前**原始值（同索引、同列序）
++    → 以后做因子解释/归因/给别的系统复用，用这份；
++  * `factor_ortho_manifest.json`：residual_columns / 对谁正交化 / β / 当时配置
++    → 复现「某轮某因子为什么是这个值」靠它（残差依赖当时的库，跨轮不可比）。
++
++特性：
++  - 确定性：同一池子 + 同一数据 ⇒ 同一结果（不引入随机性，可复现）
++  - 只用 train 段做选择（不碰 valid/test，避免挑优泄漏）
++  - 降级安全：任何异常一律回落原始因子集合（warning，不打断 loop）
++  - 耗时可控：相关性/正交化在**抽样面板**上计算（口径与 `_rank_corr` 一致，见 `max_rows`）
++
++数据来源：与因子代码**同源**的 `git_ignore_folder/factor_implementation_source_data/daily_pv.h5`
++（不依赖 qlib 运行时，避免 qlib 初始化/multiprocessing 的坑）。label 口径与回测配置一致：
++`Ref($close, -2)/Ref($close, -1) - 1`。
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++import tables
++
++from rdagent.log import rdagent_logger as logger
++
++# ---------------------------------------------------------------------------
++# 默认口径（可被 FactorBasePropSetting 覆盖）
++# ---------------------------------------------------------------------------
++DEFAULT_ENABLE = True
++DEFAULT_TOPK = 10
++DEFAULT_CORR_MAX = 0.8
++DEFAULT_MIN_ABS_IC = 0.0
++DEFAULT_MIN_ICIR_TSTAT = 2.0
++DEFAULT_LABEL = "Ref($close,-2)/Ref($close,-1)-1"
++DEFAULT_CLOSE_COL = "$close"
++DEFAULT_MIN_WINDOW = 0  # 0 = 关闭兜底窗口过滤（见 conf.factor_select_min_window 注释）
++
++# —— 2026-09-24 新增（B6~B9）——
++# ⚠️ 2026-09-25：DEFAULT_RANK_BY 由 "resid_ic" 改回 "raw_ic"。
++#   原因：残差口径（resid_t≥2）在**真实挖掘**里把新因子全否了 —— 候选都是同族变体，
++#   去掉已有因子信息后残差≈0 → 残差 t 常年 0~1.7。实测：job 103550 全新会话 3 个候选
++#   只过 1 个；job 104411/105644 的 6 个新因子 0 通过（原始 t 高达 10.59/8.73/6.92 的
++#   强因子全被否）→ 池子冻结、Calmar 卡 0.21、Replace Best 永远 no。
++#   "raw_ic" 只改「排序/准入判据」（新因子回落用原始 |ICIR|·√days≥min_icir_tstat），
++#   相关性剪枝/同族上限/入库正交化（B7/B8/B9）全部照旧生效。
++#   复核：QuantLab/scripts/factor_select_smallpool_check.py（真实小池子三口径对比）
++DEFAULT_RANK_BY = "raw_ic"         # "raw_ic"（默认）| "resid_ic"（残差口径，暂不推荐）
++DEFAULT_RESID_TSTAT_MIN = 2.0      # 残差 IC 的 t 统计量门槛（**仅 rank_by=resid_ic 时生效**）
++DEFAULT_ORTHOGONALIZE = True       # 候选入库前对库正交化
++DEFAULT_FAMILY_WINDOW_MAX = 2      # 同族（名归一去窗口）最多保留的窗口数，0=关闭
++DEFAULT_DUP_CORR = 0.95            # 同族且 |ρ| ≥ 该值 → 判重，只留残差 IC 高者
++DEFAULT_ORTHO_MAX_ROWS = 200_000   # 正交化/相关矩阵的抽样上限（行；控制耗时）
++DEFAULT_RESID_PRESELECT = 40       # 残差 IC 贪心的候选上限（按原始 |IC| 预筛，控制耗时）
++
++# 因子名里的窗口写法：xxx_20d / xxx_5D / xxx_20day（只按名字判定，不读公式/描述）
++# 与 factor_proposal._WINDOW_IN_NAME 保持同一口径（(?![a-z0-9]) 容忍 `_20d_v2` 这种写法）
++_WINDOW_IN_NAME = re.compile(r"[_\-](\d{1,4})\s*(?:d(?:ays?)?)(?![a-z0-9])", re.IGNORECASE)
++
++# 归一同义词：把「同一个东西的不同写法」映射到同一族名（B7）
++_SYNONYMS = (
++    ("momentum", "momrev"),
++    ("reversal", "momrev"),
++    ("asymmetry_ratio", "asymmetry"),
++    ("high_low_range_asymmetry", "hl_range_asym"),
++    ("overnight_intraday_spread_asymmetry", "on_id_spread_asym"),
++    ("intraday", "id"),
++    ("overnight", "on"),
++    ("volume_weighted", "vw"),
++    ("vol_scaled", "vs"),
++    ("_ratio", ""),
++    ("_rank", ""),
++)
++
++
++def _window_from_name(name: str) -> int | None:
++    """从因子名里读出最小回看窗口（交易日）；读不到返回 None（调用方应放行）。"""
++    ws = [int(m) for m in _WINDOW_IN_NAME.findall(str(name or ""))]
++    return min(ws) if ws else None
++
++
++def canonical_name(name: str) -> str:
++    """因子名归一（B7）：剥窗口后缀 + 同义词折叠 → 同族因子得到同一个 key。
++
++    例：vw_momentum_20d / volume_weighted_reversal_5d → 同 key（momrev 族，符号相反）
++        vw_hl_range_asymmetry_ratio_20d / ..._asymmetry_20d → 同 key（命名漂移重复）
++    """
++    s = str(name or "").lower()
++    s = _WINDOW_IN_NAME.sub("", s)          # 剥窗口
++    s = re.sub(r"[^a-z0-9]+", "_", s).strip("_")
++    for a, b in _SYNONYMS:
++        s = s.replace(a, b)
++    s = re.sub(r"_{2,}", "_", s).strip("_")
++    return s
++
++
++# env 开关，临时关掉用 RDAGENT_FACTOR_SELECT=0
++_ENV_SWITCH = "RDAGENT_FACTOR_SELECT"
++
++_FALSEY = {"0", "false", "False", "no", "off", ""}
++
++# daily_pv.h5 候选路径（相对 cwd 或绝对）
++_SOURCE_CANDIDATES = [
++    "git_ignore_folder/factor_implementation_source_data/daily_pv.h5",
++    "git_ignore_folder/factor_implementation_source_data/daily_pv_all.h5",
++]
++
++
++# ---------------------------------------------------------------------------
++# 源数据：只取 $close 列 + (datetime, instrument) 索引
++# ---------------------------------------------------------------------------
++def _resolve_source_path(explicit: str | None = None) -> Path:
++    if explicit:
++        p = Path(os.path.expanduser(explicit))
++        if p.exists():
++            return p
++        raise FileNotFoundError(f"指定的 daily_pv 数据不存在：{p}")
++
++    env_p = os.environ.get("RDAGENT_DAILY_PV")
++    if env_p:
++        p = Path(os.path.expanduser(env_p))
++        if p.exists():
++            return p
++
++    bases = [Path.cwd()]
++    try:  # RD-Agent 的 workspace 根（git_ignore_folder 的父目录）
++        from rdagent.core.conf import RD_AGENT_SETTINGS
++
++        ws = Path(RD_AGENT_SETTINGS.workspace_path)
++        bases += [ws, ws.parent, ws.parent.parent]
++    except Exception:
++        pass
++
++    for b in bases:
++        for rel in _SOURCE_CANDIDATES:
++            p = (b / rel).resolve()
++            if p.exists():
++                return p
++    raise FileNotFoundError("找不到 daily_pv.h5（可通过 RDAGENT_DAILY_PV 指定）")
++
++
++def load_label(
++    *,
++    wanted_instruments: np.ndarray,
++    date_lo: pd.Timestamp,
++    date_hi: pd.Timestamp,
++    source_path: str | None = None,
++    close_col: str = DEFAULT_CLOSE_COL,
++) -> pd.Series:
++    """从 daily_pv.h5 取 $close，按 instrument 做 `Ref(-2)/Ref(-1)-1`，返回 label Series。
++
++    只读取需要的列与行窗口（date_hi 额外放宽 30 天，保证 train 末端 shift 合法）。
++    """
++    path = _resolve_source_path(source_path)
++    lo = np.datetime64(pd.Timestamp(date_lo))
++    hi = np.datetime64(pd.Timestamp(date_hi) + pd.Timedelta(days=30))
++
++    with tables.open_file(str(path), "r") as f:
++        node = f.get_node("/data")
++        items = [s.decode() if isinstance(s, bytes) else str(s) for s in node.block0_items[:]]
++        if close_col not in items:
++            raise KeyError(f"{path} 中无 {close_col} 列，实际列：{items}")
++        ci = items.index(close_col)
++
++        dates = pd.to_datetime(node.axis1_level0[:])  # level0 的取值（datetime）
++        dt_codes = node.axis1_label0[:]  # 行的 level0 编码
++        inst_names = np.array(
++            [s.decode() if isinstance(s, bytes) else str(s) for s in node.axis1_level1[:]]
++        )
++        inst_codes = node.axis1_label1[:]
++
++        row_dt = dates.values[dt_codes]  # 每行日期
++        di = np.where((row_dt >= lo) & (row_dt <= hi))[0]
++
++        # 只保留目标 instrument
++        keep = np.zeros(len(inst_names), dtype=bool)
++        keep[np.where(np.isin(inst_names, wanted_instruments))[0]] = True
++        di = di[keep[inst_codes[di]]]
++
++        if di.size == 0:
++            raise ValueError("daily_pv 中没有覆盖目标 instrument/日期窗口的数据")
++
++        # 读取 $close 整列后切片（fixed 格式无法按列读，单列 ~55MB 可接受）
++        close_col_vals = np.asarray(node.block0_values[:, ci], dtype=np.float64)
++        sub = pd.Series(
++            close_col_vals[di],
++            index=pd.MultiIndex.from_arrays(
++                [row_dt[di], inst_names[inst_codes[di]]], names=["datetime", "instrument"]
++            ),
++        )
++
++    sub = sub.sort_index()
++    g = sub.groupby(level="instrument")
++    label = g.shift(-2) / g.shift(-1) - 1.0
++    label.name = "label"
++    return label
++
++
++# ---------------------------------------------------------------------------
++# 指标
++# ---------------------------------------------------------------------------
++def daily_rank_ic(factor: pd.Series, label: pd.Series) -> pd.Series:
++    """日频横截面 Spearman（截面秩的 Pearson，向量化）。
++
++    返回按日期索引的 IC 序列。
++    """
++    df = pd.DataFrame({"f": factor, "l": label}).dropna()
++    if df.empty:
++        return pd.Series(dtype=float)
++
++    d = df.index.get_level_values("datetime")
++    df["f"] = df.groupby(d)["f"].rank(pct=True)
++    df["l"] = df.groupby(d)["l"].rank(pct=True)
++
++    mean = df.groupby(d)[["f", "l"]].transform("mean")
++    a = df["f"] - mean["f"]
++    b = df["l"] - mean["l"]
++
++    num = (a * b).groupby(d).sum()
++    den = np.sqrt((a * a).groupby(d).sum() * (b * b).groupby(d).sum())
++    ic = (num / den).replace([np.inf, -np.inf], np.nan).dropna()
++    return ic.astype(float)
++
++
++def _sample_panel(df: pd.DataFrame, max_rows: int = DEFAULT_ORTHO_MAX_ROWS) -> pd.DataFrame:
++    """按整日抽样把面板压到 max_rows 行内（与 _rank_corr 同一口径，保证耗时可控）。"""
++    n_rows = len(df)
++    if n_rows <= max_rows or n_rows == 0:
++        return df
++    dates = df.index.get_level_values("datetime").unique()
++    k = max(1, int(np.ceil(n_rows / max_rows)))
++    keep = dates[::k]
++    mask = np.isin(df.index.get_level_values("datetime").values, keep.values)
++    return df.loc[mask]
++
++
++def _zscore_by_day(df: pd.DataFrame) -> pd.DataFrame:
++    """逐日截面 z-score（截面标准化）。逐日 demean ⇒ 后续 OLS 无需截距项。"""
++    g = df.groupby(level="datetime")
++    mu = g.transform("mean")
++    sd = g.transform("std")
++    sd = sd.replace(0.0, np.nan)
++    return (df - mu) / sd
++
++
++def _fit_beta(Z: pd.DataFrame, cand: str, sels: list[str]) -> np.ndarray | None:
++    """抽样面板上拟合 cand ~ sum(sels)（列已逐日 z-score，故无截距）。
++
++    返回系数向量（长度 = len(sels)）；样本不足返回 None。
++    """
++    if not sels:
++        return np.zeros(0, dtype=np.float64)
++    X = Z[sels].to_numpy(dtype=np.float64)
++    y = Z[cand].to_numpy(dtype=np.float64)
++    m = np.isfinite(X).all(axis=1) & np.isfinite(y)
++    if m.sum() < 50:
++        return None
++    A = X[m]
++    b = y[m]
++    try:
++        beta, *_ = np.linalg.lstsq(A, b, rcond=None)
++    except np.linalg.LinAlgError:
++        return None
++    return beta
++
++
++def _resid_series(Z: pd.DataFrame, cand: str, sels: list[str]) -> pd.Series:
++    """在抽样面板上返回候选因子对已选集合的残差序列（列已逐日 z-score）。"""
++    if not sels:
++        return Z[cand]
++    beta = _fit_beta(Z, cand, sels)
++    if beta is None:
++        return Z[cand] * np.nan
++    X = Z[sels].to_numpy(dtype=np.float64)
++    r = Z[cand].to_numpy(dtype=np.float64) - X @ beta
++    return pd.Series(r, index=Z.index, name=cand)
++
++
++def _rank_corr(ranks: pd.DataFrame, max_rows: int = 400_000) -> pd.DataFrame:
++    """横截面秩相关矩阵（Spearman）。行数过多时按整日抽样，保证耗时可控。"""
++    n_rows = len(ranks)
++    if n_rows > max_rows:
++        dates = ranks.index.get_level_values("datetime").unique()
++        k = max(1, int(np.ceil(n_rows / max_rows)))
++        keep_dates = dates[::k]
++        ranks = ranks.loc[np.isin(ranks.index.get_level_values("datetime").values, keep_dates.values)]
++    return ranks.corr(method="pearson")
++
++
++# ---------------------------------------------------------------------------
++# 主流程
++# ---------------------------------------------------------------------------
++def select_factors(
++    pool: pd.DataFrame,
++    *,
++    train_start: str,
++    train_end: str,
++    topk: int = DEFAULT_TOPK,
++    corr_max: float = DEFAULT_CORR_MAX,
++    min_abs_ic: float = DEFAULT_MIN_ABS_IC,
++    min_icir_tstat: float = DEFAULT_MIN_ICIR_TSTAT,
++    min_window: int = DEFAULT_MIN_WINDOW,
++    rank_by: str = DEFAULT_RANK_BY,
++    resid_tstat_min: float = DEFAULT_RESID_TSTAT_MIN,
++    orthogonalize: bool = DEFAULT_ORTHOGONALIZE,
++    family_window_max: int = DEFAULT_FAMILY_WINDOW_MAX,
++    dup_corr: float = DEFAULT_DUP_CORR,
++    sota_n: int = 0,
++    source_path: str | None = None,
++    close_col: str = DEFAULT_CLOSE_COL,
++) -> tuple[pd.DataFrame, dict]:
++    """贪心前向选择 → (选中子集, 报告)。
++
++    B6：`rank_by="resid_ic"`（**2026-09-25 起非默认**）时按**残差 IC**（对已选集合正交化后的 IC）
++        降序选择，并用 `resid_tstat_min` 做显著性门槛；`rank_by="raw_ic"`（默认）按原始 IC 排序，
++        新的显著性门槛回落为原始 |ICIR|·√days≥min_icir_tstat（= 09-19 稳定口径）。
++    B7：`dup_corr` 把「同族 + 高相关」判重（ρ≈-1 记为 sign_flip_of）。
++    B8：`orthogonalize=True` 时，**新因子**（不在 SOTA 库里的）在写入前对库做截面正交化。
++    B9：`family_window_max` 限制同族窗口数（0=关闭）。
++    """
++    # 入参由 concat(SOTA_factor, new_factors) 而来，可能含重名列；先按 runner 同口径去重（keep=last）
++    pool = pool.loc[:, ~pool.columns.duplicated(keep="last")]
++    cols = list(pool.columns)
++    report: dict = {
++        "pool": [str(c) for c in cols],
++        "selected": [str(c) for c in cols],
++        "dropped": {},
++        "metrics": {},
++        "topk": topk,
++        "corr_max": corr_max,
++        "min_abs_ic": min_abs_ic,
++        "min_icir_tstat": min_icir_tstat,
++        "min_window": min_window,
++        "rank_by": rank_by,
++        "resid_tstat_min": resid_tstat_min,
++        "orthogonalize": orthogonalize,
++        "family_window_max": family_window_max,
++        "dup_corr": dup_corr,
++        "train_window": [str(train_start), str(train_end)],
++    }
++    if len(cols) <= 1:
++        return pool, report
++
++    pool = pool.sort_index()
++    insts = pool.index.get_level_values("instrument").unique().to_numpy()
++    label = load_label(
++        wanted_instruments=insts,
++        date_lo=pd.Timestamp(train_start),
++        date_hi=pd.Timestamp(train_end),
++        source_path=source_path,
++        close_col=close_col,
++    )
++
++    # 只用 train 段
++    dt = pool.index.get_level_values("datetime")
++    m_train = (dt >= pd.Timestamp(train_start)) & (dt <= pd.Timestamp(train_end))
++    p = pool.loc[m_train]
++    y = label.reindex(p.index)
++    if p.empty:
++        raise ValueError("train 段内无因子数据")
++
++    # 1) 单因子 |RankIC| / ICIR（原始判据，保留以便对比与门槛）
++    metrics: dict = {}
++    for c in cols:
++        ic = daily_rank_ic(p[c], y)
++        if len(ic) == 0:
++            metrics[str(c)] = {"rank_ic": 0.0, "icir": 0.0, "days": 0}
++            continue
++        m = float(ic.mean())
++        s = float(ic.std(ddof=1)) if len(ic) > 1 else 0.0
++        icir = m / s if s > 0 else 0.0
++        metrics[str(c)] = {
++            "rank_ic": round(m, 6),
++            "icir": round(icir, 4),
++            "tstat": round(abs(icir) * np.sqrt(len(ic)), 2),
++            "days": int(len(ic)),
++        }
++    report["metrics"] = metrics
++
++    # 2) 秩相关矩阵（B5/B7 用）
++    ranks = p.groupby(level="datetime").rank(pct=True)
++    corr = _rank_corr(ranks, max_rows=DEFAULT_ORTHO_MAX_ROWS)
++
++    # 2b) 抽样面板（B6/B8 用；逐日 z-score 后 OLS 无截距）
++    ps = _sample_panel(p)
++    ys = y.reindex(ps.index)
++    Z = _zscore_by_day(ps)
++    report["ortho_panel"] = {"rows": int(len(ps)), "dates": int(ps.index.get_level_values("datetime").nunique())}
++
++    # 2c) 同族窗口计数用（B9）
++    canon = {c: canonical_name(c) for c in cols}
++
++    # 3) 贪心前向选择
++    selected: list = []
++    dropped: dict = {}
++    resid_cache: dict[tuple, dict] = {}
++
++    def _resid_metrics(c: str) -> dict:
++        """对当前已选集合算残差 IC / t（结果缓存，避免重复回归）。"""
++        key = (c, tuple(selected))
++        if key in resid_cache:
++            return resid_cache[key]
++        r = _resid_series(Z, c, selected)
++        ic = daily_rank_ic(r.astype(float), ys)
++        if len(ic) == 0:
++            out = {"resid_ic": 0.0, "resid_tstat": 0.0, "resid_days": 0}
++        else:
++            m = float(ic.mean())
++            s = float(ic.std(ddof=1)) if len(ic) > 1 else 0.0
++            icir = m / s if s > 0 else 0.0
++            out = {
++                "resid_ic": round(m, 6),
++                "resid_icir": round(icir, 4),
++                "resid_tstat": round(abs(icir) * np.sqrt(len(ic)), 2),
++                "resid_days": int(len(ic)),
++            }
++        resid_cache[key] = out
++        return out
++
++    # 3b) 两阶段选择：
++    #   阶段 A（种子）—— **库成员**（前 sota_n 列）只做「相关性去冗余 + 原始显著性门槛」，
++    #     不让一波相关的新因子把基线整体掀掉（离线 A/B 实测：不区分时 9 个库成员会被全淘汰，
++    #     组合反而变窄 → ReplaceBest 更难通过）。库内既有的弱/冗余因子仍可被淘汰（保留 B4/B5 初衷）。
++    #   阶段 B（增量）—— **新因子**按残差 IC（对已选集合正交化）贪心入选，走 B6~B9 全部门槛。
++    library = [str(c) for c in cols[: max(int(sota_n), 0)]]
++    cand_pool = [c for c in cols if c not in set(library)]
++    if rank_by == "resid_ic":
++        cap = max(DEFAULT_RESID_PRESELECT, topk)
++        ranked_cand = sorted(
++            cand_pool, key=lambda c: (-abs(metrics[str(c)]["rank_ic"]), -abs(metrics[str(c)]["icir"]))
++        )
++        keep_cand = set(ranked_cand[:cap])
++        for c in cand_pool:
++            if c not in keep_cand:
++                dropped[str(c)] = "resid_preselect(原始|IC|排名靠后)"
++        cand_pool = [c for c in ranked_cand if c in keep_cand]
++    report["library"] = library
++    report["candidates"] = [str(c) for c in cand_pool]
++
++    # —— 阶段 A：库成员（按原始 |RankIC| 降序做去冗余，最强代表优先占据相关簇）——
++    for c in sorted(library, key=lambda x: (-abs(metrics[str(x)]["rank_ic"]), -abs(metrics[str(x)]["icir"]))):
++        if len(selected) >= max(topk, 1):
++            dropped[str(c)] = "topk_exceeded"
++            continue
++        w = _window_from_name(str(c))
++        if min_window > 0 and w is not None and w < min_window:
++            dropped[str(c)] = f"window<{min_window}d (={w}d)"
++            continue
++        mm = metrics[str(c)]
++        if min_icir_tstat > 0 and mm["tstat"] < min_icir_tstat:
++            dropped[str(c)] = f"|ICIR|·√days<{min_icir_tstat} (t={mm['tstat']})"
++            continue
++        if min_abs_ic > 0 and abs(mm["rank_ic"]) < min_abs_ic:
++            dropped[str(c)] = f"|RankIC|<{min_abs_ic} (={mm['rank_ic']:+.4f})"
++            continue
++        if selected:
++            rho = corr.loc[c, selected]
++            cmax = float(rho.abs().max())
++            if np.isfinite(cmax) and cmax > corr_max:
++                worst = str(rho.abs().idxmax())
++                if canon[c] == canon[worst] and cmax >= dup_corr:
++                    kind = "sign_flip_of" if float(rho[worst]) < 0 else "duplicate_of"
++                    dropped[str(c)] = f"{kind}={worst} (|ρ|={cmax:.3f})"
++                else:
++                    dropped[str(c)] = f"corr>{corr_max} (max={cmax:.3f} vs {worst})"
++                continue
++        selected.append(c)
++    report["seed_selected"] = [str(c) for c in selected]
++
++    # —— 阶段 B：新因子（残差 IC 贪心，逐日对比当前已选集合）——
++    remaining = list(cand_pool)
++    while remaining and len(selected) < max(topk, 1):
++        # 每步按当前口径排序（残差 IC 依赖已选集合 → 必须重排）
++        if rank_by == "resid_ic":
++            scored = []
++            for c in remaining:
++                rm = _resid_metrics(c)
++                metrics[str(c)].update(rm)
++                scored.append((c, rm))
++            scored.sort(key=lambda kv: (-abs(kv[1]["resid_ic"]), -abs(metrics[str(kv[0])]["icir"])))
++            order_step = [c for c, _ in scored]
++        else:
++            order_step = sorted(
++                remaining,
++                key=lambda c: (-abs(metrics[str(c)]["rank_ic"]), -abs(metrics[str(c)]["icir"])),
++            )
++
++        picked = None
++        for c in order_step:
++            # B9 兜底窗口过滤（名中窗口 < min_window 交易日 → 剔除）
++            w = _window_from_name(str(c))
++            if min_window > 0 and w is not None and w < min_window:
++                dropped[str(c)] = f"window<{min_window}d (={w}d)"
++                continue
++            mm = metrics[str(c)]
++            # 原始 IC 门槛（保留，阈值默认 0 = 不拦）
++            if min_abs_ic > 0 and abs(mm["rank_ic"]) < min_abs_ic:
++                dropped[str(c)] = f"|RankIC|<{min_abs_ic} (={mm['rank_ic']:+.4f})"
++                continue
++            # 显著性：残差口径优先（B6），回落到原始 ICIR（旧口径）
++            if rank_by == "resid_ic" and resid_tstat_min > 0:
++                t = mm.get("resid_tstat", 0.0)
++                if t < resid_tstat_min:
++                    dropped[str(c)] = f"resid_t<{resid_tstat_min} (t={t}, 残差IC={mm.get('resid_ic', 0):+.4f})"
++                    continue
++            elif min_icir_tstat > 0 and mm["tstat"] < min_icir_tstat:
++                dropped[str(c)] = f"|ICIR|·√days<{min_icir_tstat} (t={mm['tstat']})"
++                continue
++            # B9：同族窗口上限
++            if family_window_max > 0 and selected:
++                fam = canon[c]
++                same = [s for s in selected if canon[s] == fam]
++                if len(same) >= family_window_max:
++                    dropped[str(c)] = f"family_window_cap({fam}={len(same)}≥{family_window_max}; 已选 {same})"
++                    continue
++            # B5/B7：与已选高相关 → 剪枝；同族极强相关（ρ≈-1 或 ≥dup_corr）单独标注
++            if selected:
++                rho = corr.loc[c, selected]
++                cmax = float(rho.abs().max())
++                if np.isfinite(cmax) and cmax > corr_max:
++                    worst = str(rho.abs().idxmax())
++                    if canon[c] == canon[worst] and cmax >= dup_corr:
++                        kind = "sign_flip_of" if float(rho[worst]) < 0 else "duplicate_of"
++                        dropped[str(c)] = f"{kind}={worst} (|ρ|={cmax:.3f})"
++                    else:
++                        dropped[str(c)] = f"corr>{corr_max} (max={cmax:.3f} vs {worst})"
++                    continue
++            picked = c
++            break
++
++        if picked is None:
++            break
++        selected.append(picked)
++        remaining.remove(picked)
++
++    if not selected:  # 兜底：至少留一个
++        fallback = sorted(cols, key=lambda c: -abs(metrics[str(c)]["rank_ic"]))[0]
++        selected = [fallback]
++        dropped.pop(str(fallback), None)
++
++    # 4) B8：新因子（不在库里的）对库做截面正交化 —— 系数在抽样面板估计，分块应用到全面板
++    ortho_info: dict = {"enabled": bool(orthogonalize), "applied": []}
++    out = pool.loc[:, [c for c in cols if c in set(selected)]]
++    if orthogonalize and len(out.columns) > 1:
++        try:
++            out, ortho_info = _apply_orthogonalization(
++                out,
++                order=selected,
++                beta_fn=lambda c, s: _fit_beta(Z, c, s),
++                # 只对**新因子**正交化（库成员保持原值，不改动既有 SOTA 口径）
++                protect=set(cols[: max(int(sota_n), 0)]),
++            )
++        except Exception as e:  # 正交化失败 → 退回未正交化的选中集合
++            logger.warning(f"[factor-select] 正交化失败，回落未正交化集合：{type(e).__name__}: {e}")
++            ortho_info = {"enabled": True, "error": f"{type(e).__name__}: {e}"}
++            out = pool.loc[:, [c for c in cols if c in set(selected)]]
++
++    sel_set = set(selected)
++    final = [c for c in cols if c in sel_set]  # 保持原列序，减少下游抖动
++    report["selected"] = [str(c) for c in final]
++    report["dropped"] = dropped
++    report["kept_order"] = [str(c) for c in selected]
++    report["canonical"] = {str(c): canon[c] for c in final}
++    report["orthogonalized"] = ortho_info
++    # B8 代价补偿：把「正交化前的原始值」随返回值带出（同一索引、同一列序），
++    # 由 select_combined_factors 落盘为 combined_factors_raw.parquet + 正交化清单。
++    raw_final = pool.loc[:, final]
++    residual_cols = [str(a["factor"]) for a in ortho_info.get("applied", []) if "beta" in a]
++    report["residual_columns"] = residual_cols
++    res = _reorder_with_values(raw_final, out, final)
++    # ⚠️ attrs 是「带出通道」，不是可落盘的数据：pandas 的 to_parquet 会把 df.attrs
++    # 序列化成 parquet 元数据 PANDAS_ATTRS，DataFrame 无法 JSON 序列化 → 下游
++    # combined_factors.to_parquet() 会直接抛 TypeError。select_combined_factors
++    # 落完旁路文件后必须调 _strip_parquet_attrs() 清掉（2026-09-25 踩过）。
++    res.attrs["raw_values"] = raw_final
++    res.attrs["residual_columns"] = residual_cols
++    return res, report
++
++
++# 挂在 DataFrame.attrs 上、但**不可**进 parquet 元数据的键（含 DataFrame，无法 JSON 化）
++_PARQUET_UNSAFE_ATTRS = ("raw_values", "residual_columns")
++
++
++def _strip_parquet_attrs(df: pd.DataFrame) -> pd.DataFrame:
++    """清掉 attrs 里不可 JSON 序列化的键，避免 to_parquet 在 PANDAS_ATTRS 处报错。"""
++    try:
++        for k in _PARQUET_UNSAFE_ATTRS:
++            df.attrs.pop(k, None)
++    except Exception:
++        pass
++    return df
++
++
++def _reorder_with_values(base: pd.DataFrame, values: pd.DataFrame, final: list) -> pd.DataFrame:
++    """按 final 顺序返回 values（正交化后的值）；缺列则由 base 兜底。"""
++    cols = []
++    for c in final:
++        if c in values.columns:
++            cols.append(values[c])
++        else:
++            cols.append(base[c])
++    res = pd.concat(cols, axis=1)
++    res.columns = final
++    return res
++
++
++def _apply_orthogonalization(
++    combined: pd.DataFrame, *, order: list, beta_fn, protect: set | None = None
++) -> tuple[pd.DataFrame, dict]:
++    """把 `order` 里第 2 个起的**新因子**对**它之前的因子**做截面正交化（B8）。
++
++    protect：不参与正交化的列（SOTA 库成员，保持既有口径不变）。
++
++    做法：逐日截面 z-score → 用**抽样面板估计**的系数 β → 分块减 X·β（全面板应用）。
++    只用当日截面信息（β 是全局估计、不是未来数据），符合防未来函数纪律。
++    返回 (正交化后的同形 DataFrame, 说明)。
++    """
++    info: dict = {"enabled": True, "applied": [], "note": "残差按逐日截面 z-score 空间计算"}
++    cols = list(combined.columns)
++    betas: dict[str, np.ndarray] = {}
++    protect = protect or set()
++    for i, c in enumerate(order):
++        if c not in cols or i == 0 or c in protect:
++            continue
++        sels = [s for s in order[:i] if s in cols]
++        if not sels:
++            continue
++        b = beta_fn(c, sels)
++        if b is None:
++            info["applied"].append({"factor": str(c), "skipped": "insufficient_overlap"})
++            continue
++        betas[c] = (sels, b)
++
++    if not betas:
++        info["note"] += "；无可正交化项"
++        return combined, info
++
++    # 分块应用：逐日 z-score 后减 X·β
++    out = combined.copy()
++    dates = combined.index.get_level_values("datetime")
++    uniq = dates.unique()
++    chunk = 200
++    for i0 in range(0, len(uniq), chunk):
++        part = uniq[i0 : i0 + chunk]
++        mask = np.isin(dates.values, part)
++        blk = out.loc[mask]
++        zb = _zscore_by_day(blk)
++        for c, (sels, b) in betas.items():
++            X = zb[sels].to_numpy(dtype=np.float64)
++            r = zb[c].to_numpy(dtype=np.float64) - X @ b
++            out.loc[blk.index, c] = r.astype(combined[c].dtype, copy=False)
++    info["applied"] = [
++        {"factor": str(c), "against": [str(s) for s in sels], "beta": [round(float(x), 6) for x in b]}
++        for c, (sels, b) in betas.items()
++    ]
++    return out, info
++
++
++def _dump_raw_and_manifest(
++    out: pd.DataFrame, report: dict, workspace: Path, *, sota_n: int = 0
++) -> None:
++    """B8 代价补偿：正交化后写进 parquet 的是**残差** → 另存一份**原始值** + 正交化**清单**。
++
++    - `combined_factors_raw.parquet`：选中列的正交化前原始值（与主 parquet 同索引、同列序）
++    - `factor_ortho_manifest.json`：哪些列被正交化 / 对谁 / β / 当时配置
++
++    未发生正交化（或拿不到原始值）则**两个文件都不写**，避免产生误导性的空清单。
++    任何异常只 warning，不影响主流程（降级安全）。
++    """
++    applied = [
++        a
++        for a in ((report.get("orthogonalized") or {}).get("applied") or [])
++        if isinstance(a, dict) and "beta" in a
++    ]
++    raw = getattr(out, "attrs", {}).get("raw_values")
++    if raw is None or not applied:
++        return
++    try:
++        raw.to_parquet(Path(workspace) / "combined_factors_raw.parquet", engine="pyarrow")
++        residual_cols = [str(a["factor"]) for a in applied]
++        residual_set = set(residual_cols)
++        manifest = {
++            "generated_at": pd.Timestamp.now().isoformat(timespec="seconds"),
++            "note": (
++                "combined_factors_df.parquet 中 residual_columns 那几列是【残差】（对当时库正交化后），"
++                "不是因子原义；原始值见 combined_factors_raw.parquet（同索引、同列序）。"
++                "做因子解释/归因/给别的系统复用时请用原始值。残差依赖当时的库 ⇒ 跨轮不可比。"
++            ),
++            "residual_columns": residual_cols,
++            "raw_columns": [str(c) for c in out.columns if str(c) not in residual_set],
++            "against": {str(a["factor"]): [str(s) for s in a.get("against", [])] for a in applied},
++            "beta": {str(a["factor"]): a.get("beta") for a in applied},
++            "sota_n": int(sota_n or 0),
++            "sota_columns": [str(c) for c in list(out.columns)[: max(int(sota_n or 0), 0)]],
++            "config": {
++                "topk": report.get("topk"),
++                "rank_by": report.get("rank_by"),
++                "resid_tstat_min": report.get("resid_tstat_min"),
++                "corr_max": report.get("corr_max"),
++                "family_window_max": report.get("family_window_max"),
++                "dup_corr": report.get("dup_corr"),
++                "train_window": report.get("train_window"),
++            },
++        }
++        (Path(workspace) / "factor_ortho_manifest.json").write_text(
++            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
++        )
++        logger.info(
++            "[factor-select] 已另存原始值 combined_factors_raw.parquet + 清单 "
++            f"factor_ortho_manifest.json（残差列 {len(residual_cols)} 个：{residual_cols}）"
++        )
++    except Exception as e:  # 补偿文件不能影响主流程
++        logger.warning(f"[factor-select] 原始值/清单写入失败（不影响主流程）：{e}")
++
++
++def select_combined_factors(
++    combined: pd.DataFrame,
++    *,
++    workspace: Path | None = None,
++    setting=None,
++    sota_n: int = 0,
++) -> pd.DataFrame:
++    """供 runner 调用的入口：读配置 → 选择 → 落报告 → 失败降级。
++
++    sota_n：`combined` 前 sota_n 列属于既有 SOTA 库（拼接顺序保证）——正交化只作用于新因子。
++    """
++    if os.environ.get(_ENV_SWITCH, "1") in _FALSEY:
++        logger.info("[factor-select] 已通过环境变量关闭，跳过因子池重选。")
++        return combined
++
++    if setting is None:
++        from rdagent.app.qlib_rd_loop.conf import FactorBasePropSetting
++
++        setting = FactorBasePropSetting()
++
++    enable = bool(getattr(setting, "factor_select_enable", DEFAULT_ENABLE))
++    if not enable:
++        logger.info("[factor-select] 配置关闭（factor_select_enable=False），跳过因子池重选。")
++        return combined
++
++    def _env_override(name: str, cur):
++        """单独用环境变量覆盖某项（如 RDAGENT_FACTOR_ORTHOGONALIZE=0）"""
++        v = os.environ.get(name)
++        if v is None:
++            return cur
++        if isinstance(cur, bool):
++            return v not in _FALSEY
++        if isinstance(cur, int):
++            try:
++                return int(v)
++            except ValueError:
++                return cur
++        if isinstance(cur, float):
++            try:
++                return float(v)
++            except ValueError:
++                return cur
++        return v
++
++    kwargs = dict(
++        train_start=setting.train_start,
++        train_end=setting.train_end,
++        topk=int(getattr(setting, "factor_select_topk", DEFAULT_TOPK)),
++        corr_max=float(getattr(setting, "factor_select_corr_max", DEFAULT_CORR_MAX)),
++        min_abs_ic=float(getattr(setting, "factor_select_min_abs_ic", DEFAULT_MIN_ABS_IC)),
++        min_icir_tstat=float(
++            getattr(setting, "factor_select_min_icir_tstat", DEFAULT_MIN_ICIR_TSTAT)
++        ),
++        min_window=int(getattr(setting, "factor_select_min_window", DEFAULT_MIN_WINDOW)),
++        rank_by=_env_override(
++            "RDAGENT_FACTOR_RANK_BY", str(getattr(setting, "factor_select_rank_by", DEFAULT_RANK_BY))
++        ),
++        resid_tstat_min=_env_override(
++            "RDAGENT_FACTOR_RESID_TSTAT_MIN",
++            float(getattr(setting, "factor_select_resid_tstat_min", DEFAULT_RESID_TSTAT_MIN)),
++        ),
++        orthogonalize=_env_override(
++            "RDAGENT_FACTOR_ORTHOGONALIZE",
++            bool(getattr(setting, "factor_select_orthogonalize", DEFAULT_ORTHOGONALIZE)),
++        ),
++        family_window_max=_env_override(
++            "RDAGENT_FACTOR_FAMILY_WINDOW_MAX",
++            int(getattr(setting, "factor_select_family_window_max", DEFAULT_FAMILY_WINDOW_MAX)),
++        ),
++        dup_corr=_env_override(
++            "RDAGENT_FACTOR_DUP_CORR",
++            float(getattr(setting, "factor_select_dup_corr", DEFAULT_DUP_CORR)),
++        ),
++        sota_n=int(sota_n or 0),
++        source_path=getattr(setting, "factor_select_source_path", None),
++        close_col=str(getattr(setting, "factor_select_close_col", DEFAULT_CLOSE_COL)),
++    )
++    report: dict = {"enabled": True, "ok": False}
++    try:
++        out, rep = select_factors(combined, **kwargs)
++        report.update(rep)
++        report["ok"] = True
++    except Exception as e:  # 降级：任何异常都不该打断 loop
++        report["error"] = f"{type(e).__name__}: {e}"
++        logger.warning(f"[factor-select] 因子选择失败，回落原始因子集合：{report['error']}")
++        out = combined
++
++    if report.get("ok"):
++        try:
++            logger.info(
++                f"[factor-select] 池 {len(combined.columns)} → 选中 {len(out.columns)}："
++                f"{list(map(str, out.columns))}｜rank_by={report.get('rank_by')}｜"
++                f"正交化={bool(report.get('orthogonalized', {}).get('applied'))}｜淘汰：{report['dropped']}"
++            )
++            logger.log_object(report, tag="factor selection report")
++        except Exception as e:
++            logger.warning(f"[factor-select] 日志记录失败：{e}")
++
++    if workspace is not None:
++        try:
++            report["effective_columns"] = [str(c) for c in out.columns]
++            (Path(workspace) / "factor_selection_report.json").write_text(
++                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
++            )
++        except Exception as e:
++            logger.warning(f"[factor-select] 报告写入失败：{e}")
++        # B8 代价补偿：另存原始值 + 正交化清单（未正交化则跳过）
++        _dump_raw_and_manifest(out, report, Path(workspace), sota_n=int(sota_n or 0))
++    # 旁路文件已落盘 → 清掉不可序列化的 attrs，保证下游 to_parquet 正常
++    # （pandas 会 json.dumps(df.attrs) 写 PANDAS_ATTRS，DataFrame 会直接炸）
++    return _strip_parquet_attrs(out)
+diff --git a/rdagent/scenarios/qlib/developer/feedback.py b/rdagent/scenarios/qlib/developer/feedback.py
+index 58fcfbd..f3e9a93 100644
+--- a/rdagent/scenarios/qlib/developer/feedback.py
++++ b/rdagent/scenarios/qlib/developer/feedback.py
+@@ -46,11 +46,85 @@ def process_results(current_result, sota_result):
+             current = row["Current Result"]
+             sota = row["SOTA Result"]
+             results.append(f"{metric} of Current Result is {current:.6f}, of SOTA Result is {sota:.6f}")
++        # 追加 Calmar（= 年化收益 / |最大回撤|，含成本），作为主判定指标喂给 LLM
++        ann_metric = "1day.excess_return_with_cost.annualized_return"
++        mdd_metric = "1day.excess_return_with_cost.max_drawdown"
++        cur_calmar = filtered_combined_df.loc[ann_metric, "Current Result"] / abs(
++            filtered_combined_df.loc[mdd_metric, "Current Result"]
++        )
++        sota_calmar = filtered_combined_df.loc[ann_metric, "SOTA Result"] / abs(
++            filtered_combined_df.loc[mdd_metric, "SOTA Result"]
++        )
++        results.append(
++            f"Calmar (= annualized_return / |max_drawdown|, with cost) of Current Result is {cur_calmar:.6f}, "
++            f"of SOTA Result is {sota_calmar:.6f}"
++        )
+         return "; ".join(results)
+ 
+     return format_filtered_combined_df(filtered_combined_df)
+ 
+ 
++def calmar_with_cost(result) -> float | None:
++    """从回测 result 里算含成本 Calmar（年化收益 / |最大回撤|）；取不到返回 None。"""
++    if result is None:
++        return None
++    try:
++        ann = float(result["1day.excess_return_with_cost.annualized_return"])
++        mdd = float(result["1day.excess_return_with_cost.max_drawdown"])
++    except Exception:
++        return None
++    if not mdd:
++        return None
++    c = ann / abs(mdd)
++    if c != c:  # NaN 保护
++        return None
++    return c
++
++
++def historical_best_result(trace):
++    """返回会话历史最优实验（按含成本 Calmar）的 result。
++
++    2026-09-20 修复（棘轮基线退化）：
++    原判定基线是 `exp.based_experiments[-1].result`，而 based_experiments 只收
++    `feedback.decision is True` 的实验 —— 一旦上游停滞重启（B6）清空 decision 标记，
++    based_experiments 会退化成 [种子基线]，基线 Calmar 从会话最优 0.525 掉到 0.094，
++    劣质组合（0.102）就能被判 Replace Best=yes 覆盖掉最优（rd_20260920_151207）。
++    这里改为遍历 trace.hist 全量实验（**不看 decision**），取 Calmar 最高者作基线，
++    这样清空标记 / 重启都不会再动到棘轮基线。
++    """
++    best_result, best_calmar = None, None
++    for item in getattr(trace, "hist", None) or []:
++        exp = item[0] if isinstance(item, (tuple, list)) and len(item) > 0 else item
++        r = getattr(exp, "result", None)
++        if r is None:
++            continue
++        c = calmar_with_cost(r)
++        if c is None:
++            continue
++        if best_calmar is None or c > best_calmar:
++            best_result, best_calmar = r, c
++    return best_result
++
++
++def ratchet_guard(decision: bool, current_result, sota_result) -> bool:
++    """棘轮硬闸（只降不升）：当前 Calmar 未超过基线时，禁止 Replace Best=yes。
++
++    防止 LLM 在边界情形下误判；仅在能同时取到两个 Calmar 时生效，且只会把 yes 降成 no。
++    """
++    if not decision:
++        return False
++    cur = calmar_with_cost(current_result)
++    base = calmar_with_cost(sota_result)
++    if cur is None or base is None:
++        return decision
++    if cur <= base:
++        logger.warning(
++            f"[ratchet] 本轮 Calmar {cur:.6f} 未超过基线 {base:.6f}，强制 Replace Best=no"
++        )
++        return False
++    return True
++
++
+ class QlibFactorExperiment2Feedback(Experiment2Feedback):
+     def generate_feedback(self, exp: Experiment, trace: Trace) -> HypothesisFeedback:
+         """
+@@ -69,7 +143,10 @@ class QlibFactorExperiment2Feedback(Experiment2Feedback):
+         hypothesis_text = hypothesis.hypothesis
+         current_result = exp.result
+         tasks_factors = [task.get_task_information_and_implementation_result() for task in exp.sub_tasks]
+-        sota_result = exp.based_experiments[-1].result
++        # 2026-09-20：判定基线 = 会话历史最优（含成本 Calmar），而非 based_experiments[-1]
++        #（= 最后一个 decision=True 的实验）。后者在停滞重启清空 decision 后会退化成种子基线。
++        best_ever = historical_best_result(trace)
++        sota_result = best_ever if best_ever is not None else exp.based_experiments[-1].result
+ 
+         # Process the results to filter important metrics
+         combined_result = process_results(current_result, sota_result)
+@@ -108,6 +185,7 @@ class QlibFactorExperiment2Feedback(Experiment2Feedback):
+         new_hypothesis = response_json.get("New Hypothesis", "No new hypothesis provided")
+         reason = response_json.get("Reasoning", "No reasoning provided")
+         decision = convert2bool(response_json.get("Replace Best Result", "no"))
++        decision = ratchet_guard(decision, current_result, sota_result)
+ 
+         return HypothesisFeedback(
+             observations=observations,
+diff --git a/rdagent/scenarios/qlib/developer/stagnation_restart.py b/rdagent/scenarios/qlib/developer/stagnation_restart.py
+new file mode 100644
+index 0000000..3b5ee09
+--- /dev/null
++++ b/rdagent/scenarios/qlib/developer/stagnation_restart.py
+@@ -0,0 +1,199 @@
++"""停滞自动重启（B6）
++
++背景（2026-09-19 定位）
++-----------------------
++Replace Best 是一把**棘轮**：只有当新组合的 Calmar 赢过 SOTA、且回撤不劣化（>3pp）时
++才允许替换基线。连续多轮 no-replace 之后，LLM 的提案会退化成对 SOTA 的局部变体
++（实测：`roe_trend_filter` → `roe_trend_filter_100d`、`reversal_5d_vol_scaled` → `..._20d`），
++loop 卡死在局部最优 —— 2026-09-12 09:50 ~ 09-16 08:30 连续约 20 次运行 `active_factors`
++一个字没变。
++
++B4/B5（factor_selector）解决了「因子池只增不减、弱因子永久占位」，
++但棘轮本身还在：新组合只要在同一批老因子上加料，就很难同时赢 Calmar + 不劣化回撤。
++
++本模块（B6）提供**停滞自动重启**：连续 `patience` 轮 Replace Best=no ⇒ 清空 SOTA 基线，
++让 loop 回到「首轮语义」重新出发。
++
++机制（为什么清空 decision 就够了）
++----------------------------------
++`Trace.get_sota_hypothesis_and_experiment()` 逆序遍历 `hist`，返回**最后一个
++`feedback.decision is True`** 的实验 —— SOTA 完全由 decision 标记决定。因此：
++
++1. 把 hist 里所有 `feedback.decision` 置 False ⇒ `get_sota_*()` 返回 None ⇒
++   回测反馈没有对比基线、不再被棘轮卡住；
++2. `ExperimentFeedback.__bool__` 返回 `decision`，而提案侧
++   `exp.based_experiments = [dummy] + [t[0] for t in trace.hist if t[1] and ...]`
++   ⇒ 因子池同时被清空（等价于首轮），真正做到「重开」；
++3. 下一轮只要 Replace Best=yes，就立刻建立**新基线**（棘轮归零后重新开始爬）。
++
++⚠️ 第 2 点的下一轮与「loop 0」代码路径完全一致（`based_experiments=[dummy]`、无 SOTA），
++该路径每次运行都会跑，已被真实验证安全。
++
++防抖
++----
++重启后 hist 尾部全是 False，若不记状态会每轮重复触发。故在 trace 上记录
++`_stagnation_restart_at`（重启时的 hist 长度）与 `_stagnation_restart_count`；
++要求「距上次重启至少 `patience` 轮」才再次触发。Trace 是普通 Python 类，属性随
++session pickle 一起持久化，续跑不丢。
++
++安全
++----
++任何异常一律 warning 跳过，不打断 loop。关闭：env `RDAGENT_FACTOR_RESTART=0`。
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Any
++
++from rdagent.log import rdagent_logger as logger
++
++DEFAULT_ENABLE = False
++# 2026-09-20：默认关闭。
++# 原因：清空 decision 会把 Replace 判定基线从「会话最优」退化成「种子基线」，
++# 首个真实停滞场景（rd_20260920_151207 / Loop_8）就把 0.525 的最优组合覆盖成 0.102。
++# 判定基线已改为「会话历史最优」（见 developer/feedback.py historical_best_result），
++# 但重启本身在真实场景仍未验证，默认 OFF；显式打开用 RDAGENT_FACTOR_RESTART=1。
++DEFAULT_PATIENCE = 3
++
++# env 开关，临时关掉用 RDAGENT_FACTOR_RESTART=0
++_ENV_SWITCH = "RDAGENT_FACTOR_RESTART"
++_FALSEY = {"0", "false", "False", "no", "off", ""}
++
++_ATTR_AT = "_stagnation_restart_at"
++_ATTR_COUNT = "_stagnation_restart_count"
++
++
++# ---------------------------------------------------------------------------
++# 配置
++# ---------------------------------------------------------------------------
++def _load_setting() -> Any:
++    """读取 FactorBasePropSetting（读不到就返回 None，走默认值）。"""
++    try:
++        from rdagent.app.qlib_rd_loop.conf import FactorBasePropSetting
++
++        return FactorBasePropSetting()
++    except Exception:  # pragma: no cover - 配置缺失时保持可用
++        return None
++
++
++def _env_disabled() -> bool:
++    """`RDAGENT_FACTOR_RESTART=0/False/no/off` 时强制关闭（与 factor_selector 的开关风格一致）。
++
++    注意：不能只靠 setting 属性 —— `FactorBasePropSetting` 的 env_prefix 是 `QLIB_FACTOR_`，
++    对应的环境变量名会是 `QLIB_FACTOR_FACTOR_RESTART_ENABLE`，与文档里承诺的
++    `RDAGENT_FACTOR_RESTART` 不是同一个，故这里显式读 os.environ。
++    """
++    return os.environ.get(_ENV_SWITCH, "1").strip() in _FALSEY
++
++
++def _resolve(enable: bool | None, patience: int | None) -> tuple[bool, int]:
++    setting = _load_setting()
++    if enable is None:
++        if _env_disabled():
++            enable = False
++        else:
++            enable = (
++                getattr(setting, "factor_restart_enable", DEFAULT_ENABLE)
++                if setting
++                else DEFAULT_ENABLE
++            )
++            if str(enable).strip() in _FALSEY:
++                enable = False
++    if patience is None:
++        patience = (
++            int(getattr(setting, "factor_restart_patience", DEFAULT_PATIENCE))
++            if setting
++            else DEFAULT_PATIENCE
++        )
++    return bool(enable), max(1, int(patience))
++
++
++# ---------------------------------------------------------------------------
++# 核心
++# ---------------------------------------------------------------------------
++def _feedback_of(item: Any) -> Any:
++    """hist 条目是 (exp, feedback) 元组；兼容不带 feedback 的写法。"""
++    if isinstance(item, (tuple, list)):
++        return item[1] if len(item) > 1 else None
++    return getattr(item, "feedback", None)
++
++
++def consecutive_no_replace(trace: Any) -> int:
++    """统计 hist 尾部连续 Replace Best=no 的轮数（遇到 decision=True 即止）。"""
++    hist = getattr(trace, "hist", None) or []
++    n = 0
++    for item in reversed(hist):
++        fb = _feedback_of(item)
++        if fb is None:
++            continue
++        if getattr(fb, "decision", False):
++            break
++        n += 1
++    return n
++
++
++def clear_sota_decisions(trace: Any) -> int:
++    """把所有历史 feedback.decision 置 False ⇒ SOTA 与因子池一起回到首轮状态。"""
++    cleared = 0
++    for item in getattr(trace, "hist", None) or []:
++        fb = _feedback_of(item)
++        if fb is not None and getattr(fb, "decision", False):
++            fb.decision = False
++            cleared += 1
++    return cleared
++
++
++def maybe_restart_on_stagnation(
++    trace: Any,
++    *,
++    enable: bool | None = None,
++    patience: int | None = None,
++    loop_idx: int | None = None,
++) -> dict | None:
++    """停机检测 + 重启入口。返回本次动作报告；未触发返回 None。"""
++    enable, patience = _resolve(enable, patience)
++    if not enable:
++        return None
++
++    n_stall = consecutive_no_replace(trace)
++    if n_stall < patience:
++        return None
++
++    hist_len = len(getattr(trace, "hist", None) or [])
++    last_at = int(getattr(trace, _ATTR_AT, 0) or 0)
++    if hist_len - last_at < patience:
++        # 距上次重启不足 patience 轮，防抖：不重复清空
++        return None
++
++    prev_count = int(getattr(trace, _ATTR_COUNT, 0) or 0)
++    cleared = clear_sota_decisions(trace)
++    report = {
++        "event": "stagnation_restart",
++        "loop_idx": loop_idx,
++        "stagnation_rounds": n_stall,
++        "patience": patience,
++        "cleared_decisions": cleared,
++        "hist_len_at_restart": hist_len,
++        "restart_count": prev_count + 1,
++        "action": "清空全部 Replace Best=yes 标记 ⇒ SOTA 基线与因子池回到首轮语义，下一轮重新建立新基线",
++    }
++
++    # 状态写回 trace（随 session pickle 持久化），放在动作之后，避免异常导致状态漂移
++    try:
++        setattr(trace, _ATTR_AT, hist_len)
++        setattr(trace, _ATTR_COUNT, prev_count + 1)
++    except Exception as e:  # pragma: no cover
++        logger.warning(f"[stagnation-restart] 状态写回失败（忽略）：{e}")
++
++    try:
++        logger.log_object(report, tag="stagnation restart report")
++    except Exception as e:  # pragma: no cover - 日志失败不影响主流程
++        logger.warning(f"[stagnation-restart] 报告落盘失败（忽略）：{e}")
++
++    logger.info(
++        f"[stagnation-restart] 连续 {n_stall} 轮 Replace Best=no（阈值 {patience}）"
++        f"→ 清空 {cleared} 条 yes 标记，SOTA 基线重置，下一轮重新出发。"
++        f"（第 {prev_count + 1} 次重启；loop_idx={loop_idx}）"
++    )
++    return report
+diff --git a/rdagent/scenarios/qlib/experiment/factor_data_template/README.md b/rdagent/scenarios/qlib/experiment/factor_data_template/README.md
+index d03534d..4f3e636 100644
+--- a/rdagent/scenarios/qlib/experiment/factor_data_template/README.md
++++ b/rdagent/scenarios/qlib/experiment/factor_data_template/README.md
+@@ -10,7 +10,7 @@ NOTE: **key is always "data" for all hdf5 files **.
+ 
+ | Filename       | Description                                                      |
+ | -------------- | -----------------------------------------------------------------|
+-| "daily_pv.h5"  | Adjusted daily price and volume data.                            |
++| "daily_pv.h5"  | Adjusted daily price-volume data (daily panel, index = [datetime, instrument]). |
+ 
+ 
+ # For different data, We have some basic knowledge for them
+@@ -21,4 +21,8 @@ $close: close price of the stock on that day.
+ $high: high price of the stock on that day.
+ $low: low price of the stock on that day.
+ $volume: volume of the stock on that day.
+-$factor: factor value of the stock on that day.
+\ No newline at end of file
++$factor: factor value of the stock on that day.
++
++> NOTE: Only price-volume fields are available in `daily_pv.h5`. Do NOT design factors that
++> reference fundamental fields (e.g. ROE, margins, growth, per-share, solvency or turnover
++> ratios) — those columns do not exist in the data and such factors will fail.
+diff --git a/rdagent/scenarios/qlib/experiment/factor_data_template/generate.py b/rdagent/scenarios/qlib/experiment/factor_data_template/generate.py
+index f05aee5..aac8e9b 100644
+--- a/rdagent/scenarios/qlib/experiment/factor_data_template/generate.py
++++ b/rdagent/scenarios/qlib/experiment/factor_data_template/generate.py
+@@ -1,13 +1,55 @@
++import os
++
++import pandas as pd
+ import qlib
+ 
+-qlib.init(provider_uri="~/.qlib/qlib_data/cn_data")
++qlib.init(provider_uri="~/.qlib/qlib_data_cn_1999_2025")
++from qlib.config import C
++
++# macOS 上 multiprocessing 默认 spawn，qlib 默认 joblib_backend=multiprocessing 会触发
++# RuntimeError(freeze_support)，改用 threading backend（数据拉取以 I/O + numpy 为主，足够）
++C.joblib_backend = "threading"
+ 
+ from qlib.data import D
+ 
++# ── 基本面面板（QuantLab 注入）─────────────────────────────────────
++# 由 ~/.openclaw/workspace/QuantLab/backend/services/build_fundamental_panel.py 生成
++# 结构: MultiIndex[datetime=公告日, instrument] × 20 个基本面字段(float32)
++FUNDAMENTAL_H5 = os.path.expanduser("~/.qlib/fundamental_panel.h5")
++
++
++def attach_fundamental(df: pd.DataFrame) -> pd.DataFrame:
++    """把基本面字段按 point-in-time（公告日生效）合并进日频价量表。
++
++    做法: 以目标日频索引为骨架，与事件级基本面表 concat → 按 instrument
++    组内前向填充(ffill) → 对齐回原索引。ffill 严格取"已公告"的最新值，
++    不会引入未来信息。
++    """
++    if os.environ.get("RDAGENT_NO_FUNDAMENTAL") or not os.path.exists(FUNDAMENTAL_H5):
++        print(f"[fundamental] skipped (exists={os.path.exists(FUNDAMENTAL_H5)})")
++        return df
++
++    fund = pd.read_hdf(FUNDAMENTAL_H5, key="data")
++    fund.index = fund.index.set_names(["datetime", "instrument"])
++
++    # 骨架：覆盖每一天，保证没有公告的日子也能被 ffill 填上
++    skel = pd.DataFrame(index=df.index, columns=fund.columns, dtype="float32")
++
++    comb = pd.concat([fund, skel]).sort_index(kind="stable")
++    comb = comb[~comb.index.duplicated(keep="first")]  # 同日已有公告值 → 保留真实值
++    comb = comb.groupby(level="instrument", sort=False).ffill()
++    comb = comb.reindex(df.index)
++
++    out = pd.concat([df, comb], axis=1)
++    print(f"[fundamental] merged {comb.shape[1]} fields -> {out.shape}")
++    return out
++
++
+ instruments = D.instruments()
+ fields = ["$open", "$close", "$high", "$low", "$volume", "$factor"]
+ data = D.features(instruments, fields, freq="day").swaplevel().sort_index().loc["2008-12-29":].sort_index()
+ 
++data = attach_fundamental(data)
+ data.to_hdf("./daily_pv_all.h5", key="data")
+ 
+ 
+@@ -24,4 +66,5 @@ data = (
+     .sort_index()
+ )
+ 
++data = attach_fundamental(data)
+ data.to_hdf("./daily_pv_debug.h5", key="data")
+diff --git a/rdagent/scenarios/qlib/experiment/factor_template/conf_baseline.yaml b/rdagent/scenarios/qlib/experiment/factor_template/conf_baseline.yaml
+index 4583dc3..1cfebd7 100644
+--- a/rdagent/scenarios/qlib/experiment/factor_template/conf_baseline.yaml
++++ b/rdagent/scenarios/qlib/experiment/factor_template/conf_baseline.yaml
+@@ -1,5 +1,5 @@
+ qlib_init:
+-    provider_uri: "~/.qlib/qlib_data/cn_data"
++    provider_uri: "~/.qlib/qlib_data_cn_1999_2025"
+     region: cn
+ 
+ market: &market csi300
+diff --git a/rdagent/scenarios/qlib/experiment/factor_template/conf_combined_factors.yaml b/rdagent/scenarios/qlib/experiment/factor_template/conf_combined_factors.yaml
+index df53569..d496f32 100644
+--- a/rdagent/scenarios/qlib/experiment/factor_template/conf_combined_factors.yaml
++++ b/rdagent/scenarios/qlib/experiment/factor_template/conf_combined_factors.yaml
+@@ -1,5 +1,5 @@
+ qlib_init:
+-    provider_uri: "~/.qlib/qlib_data/cn_data"
++    provider_uri: "~/.qlib/qlib_data_cn_1999_2025"
+     region: cn
+ 
+ market: &market csi300
+diff --git a/rdagent/scenarios/qlib/experiment/factor_template/conf_combined_factors_sota_model.yaml b/rdagent/scenarios/qlib/experiment/factor_template/conf_combined_factors_sota_model.yaml
+index f47941e..c9b223b 100644
+--- a/rdagent/scenarios/qlib/experiment/factor_template/conf_combined_factors_sota_model.yaml
++++ b/rdagent/scenarios/qlib/experiment/factor_template/conf_combined_factors_sota_model.yaml
+@@ -1,5 +1,5 @@
+ qlib_init:
+-    provider_uri: "~/.qlib/qlib_data/cn_data"
++    provider_uri: "~/.qlib/qlib_data_cn_1999_2025"
+     region: cn
+ 
+ market: &market csi300
+diff --git a/rdagent/scenarios/qlib/experiment/model_template/conf_baseline_factors_model.yaml b/rdagent/scenarios/qlib/experiment/model_template/conf_baseline_factors_model.yaml
+index ef6cb0a..60ea1d0 100644
+--- a/rdagent/scenarios/qlib/experiment/model_template/conf_baseline_factors_model.yaml
++++ b/rdagent/scenarios/qlib/experiment/model_template/conf_baseline_factors_model.yaml
+@@ -1,5 +1,5 @@
+ qlib_init:
+-    provider_uri: "~/.qlib/qlib_data/cn_data"
++    provider_uri: "~/.qlib/qlib_data_cn_1999_2025"
+     region: cn
+ market: &market csi300
+ benchmark: &benchmark SH000300
+diff --git a/rdagent/scenarios/qlib/experiment/model_template/conf_sota_factors_model.yaml b/rdagent/scenarios/qlib/experiment/model_template/conf_sota_factors_model.yaml
+index f47941e..c9b223b 100644
+--- a/rdagent/scenarios/qlib/experiment/model_template/conf_sota_factors_model.yaml
++++ b/rdagent/scenarios/qlib/experiment/model_template/conf_sota_factors_model.yaml
+@@ -1,5 +1,5 @@
+ qlib_init:
+-    provider_uri: "~/.qlib/qlib_data/cn_data"
++    provider_uri: "~/.qlib/qlib_data_cn_1999_2025"
+     region: cn
+ 
+ market: &market csi300
+diff --git a/rdagent/scenarios/qlib/experiment/utils.py b/rdagent/scenarios/qlib/experiment/utils.py
+index f07eed8..4a4b120 100644
+--- a/rdagent/scenarios/qlib/experiment/utils.py
++++ b/rdagent/scenarios/qlib/experiment/utils.py
+@@ -1,3 +1,4 @@
++import os
+ import random
+ import re
+ import shutil
+@@ -7,12 +8,12 @@ import pandas as pd
+ from jinja2 import Environment, StrictUndefined
+ 
+ from rdagent.components.coder.factor_coder.config import FACTOR_COSTEER_SETTINGS
+-from rdagent.utils.env import QTDockerEnv
++from rdagent.utils.env import CondaConf, LocalEnv
+ 
+ 
+ def generate_data_folder_from_qlib():
+     template_path = Path(__file__).parent / "factor_data_template"
+-    qtde = QTDockerEnv()
++    qtde = LocalEnv(conf=CondaConf(conda_env_name=os.environ.get("CONDA_DEFAULT_ENV", "rdagent")))
+     qtde.prepare()
+ 
+     # Run the Qlib backtest
+diff --git a/rdagent/scenarios/qlib/prompts.yaml b/rdagent/scenarios/qlib/prompts.yaml
+index b1a147a..a1e86bc 100644
+--- a/rdagent/scenarios/qlib/prompts.yaml
++++ b/rdagent/scenarios/qlib/prompts.yaml
+@@ -1,6 +1,7 @@
+ hypothesis_and_feedback: |-
+   =========================================================
+   {% for experiment, feedback in trace.hist %}
++  {% if experiment is not none %}
+   # Trial {{ loop.index }}: 
+   ## Hypothesis
+   {{ experiment.hypothesis }}
+@@ -18,6 +19,7 @@ hypothesis_and_feedback: |-
+   Hypothesis Evaluation: {{ feedback.hypothesis_evaluation }}
+   Decision (Whether the hypothesis was successful): {{ feedback.decision }}
+   =========================================================
++  {% endif %}
+   {% endfor %}
+ 
+ last_hypothesis_and_feedback: |-
+@@ -110,6 +112,31 @@ factor_hypothesis_specification: |-
+   5. Note
+     - Highlight that factors surpassing SOTA are included in the library to avoid re-implementation.
+     - No matter how many factors you plan to generate, only reply with one set of hypothesis and reason. The hypothesis can include the proposal of multiple factors at the same time.
++  6. Avoid Semantic Duplicates (2026-09-09, strengthened 2026-09-24):
++    - Do NOT re-propose a factor that is semantically equivalent to any previously tested factor (whether it surpassed SOTA or FAILED), even with a different lookback window, a different name, or a cosmetic suffix.
++    - Same lookback window + same mechanism = SAME factor, absolutely forbidden. This includes cosmetic variants such as `xxx_20d` vs `xxx_20d_v2` / `xxx_20d_filtered` / `xxx_20d_winsorized` / `xxx_20d_scaled` — they will be automatically rejected by the pipeline.
++  - NAMING VARIANTS ARE THE SAME FACTOR (2026-09-24, HARD RULE): renaming never creates a new factor. Abbreviations, full names and aliases all count as SAME: `ILLIQ_20D` = `amihud_illiq_20d` = `amihud_illiquidity_20d` = `illiquidity_20d`; `DOWNBETA_60D` = `downside_beta_60d`; `MOM_5D` = `momentum_5d` = `price_momentum_5d`; `VOL_20D` = `realized_volatility_20d` = `rv_20d`; `CLV_20D` = `close_location_value_20d`; `DOWNCORR_60D` = `downside_corr_60d`; `VOLRATIO_20D` = `volume_ratio_20d`; `VPT_20D` = `PVT_20D` = `volume_price_trend_20d` = `price_volume_trend_20d`; `VWAP_DEV_20D` = `vwap_deviation_20d`; `PV_CORR_20d` = `price_volume_corr_20d` = `return_volume_corr_20d`. The pipeline canonicalises families, so these WILL be rejected. Pick a genuinely unexplored mechanism instead.
++    - Same mechanism with a different lookback window (e.g. `price_volume_corr_5d` / `price_volume_corr_10d` / `price_volume_corr_20d`) is still the SAME factor family and should be treated as already explored unless you can justify a genuinely different economic mechanism.
++    - Before proposing, scan `hypothesis_and_feedback` for ALL previously attempted factors AND the family inventory list, and stay away from the families already listed there. The family inventory is CANONICALISED (aliases merged), so a family listed once covers all its naming variants.
++    - DIVERSITY REQUIREMENT: when you propose more than one factor in a round, they must cover at least 2 DIFFERENT families (not 2 windows of the same family).
++  7. Compute Feasibility within the Execution Time Limit (2026-09-15, v2):
++    - Hard budget: the factor implementation MUST finish within the factor execution time limit (currently 600 seconds) over the full research panel (thousands of instruments x thousands of trading days). Budget at most ~10 minutes of compute.
++    - NEVER fit a model per instrument and/or per trading day (e.g. `groupby(...).apply()` with a `model.fit()` inside the row loop, or a rolling/expanding regression that refits once for every date `t`). These are computationally infeasible and will always time out.
++    - Pooled / cross-sectional regression does NOT count as vectorized by itself: a loop `for t in dates: model.fit(...)` over thousands of dates is exactly the forbidden failure mode.
++    - If any model fitting is unavoidable, the TOTAL number of model fits for the whole backtest MUST be <= 100: refit at most once per month or quarter (e.g. every ~60 trading days) and reuse the fitted coefficients between refits. Train each fit on a bounded panel (e.g. the trailing 12-24 months, optionally a subsample of instruments), not on the full history.
++    - Strongly prefer closed-form / vectorized formulations that require ZERO or a single model fit: plain rolling statistics (means, ranks, correlations, ratios, volatility), or a SINGLE pooled panel-wide OLS/ridge solved with closed-form linear algebra (e.g. `numpy.linalg.lstsq` on the stacked panel) over the whole sample.
++    - State the retraining plan explicitly in the factor description/formulation (e.g. "no refit" / "one pooled fit" / "refit quarterly"), so the implementation follows it. If you cannot express the factor with <= 100 total fits, choose a closed-form formulation instead.
++  8. Minimum Lookback Window = 5 Trading Days (2026-09-24, HARD RULE):
++    - EVERY proposed factor MUST use a lookback window of AT LEAST 5 trading days. Name the window in the factor name with the `_Nd` convention (e.g. `_5d`, `_10d`, `_20d`, `_60d`).
++    - Factors with a lookback window of 1, 2, 3 or 4 days are STRICTLY FORBIDDEN (e.g. `intraday_range_1d`, `overnight_gap_1d`, `close_location_value_1d`, `intraday_momentum_3d`). They are intraday noise: their Rank IC sits at the noise floor (~0.01-0.02), they do not replicate across sessions, and they will be automatically rejected at the proposal layer.
++    - If a short-horizon signal seems attractive, express it over a >= 5-day window instead (e.g. use `_5d` where you would have used `_1d`), or use a daily-to-weekly aggregation (mean / sum / std over the last 5 trading days).
++    - If a factor needs an intraday (open/high/low/close) input, that is fine — as long as the AGGREGATION/LOOKBACK window is >= 5 trading days.
++  9. Vectorization Is Mandatory (2026-09-24, HARD RULE):
++    - NEVER write a day-by-day Python loop over the panel. `for i in range(len(...))`, `for d in dates:` and `groupby(...).apply(fn)` where `fn` contains a `for` loop are all FORBIDDEN — even when there is no model fit inside.
++    - Measured on this dataset: a vectorized factor takes 0.2-5 seconds; the very same idea written as a per-day Python loop takes 123s to >900s and gets KILLED by the hard execution timeout (600s), wasting an entire round.
++    - Simple lookbacks: use per-stock positional rolling via `df.groupby(level="instrument").rolling(W)`, or the cheap equivalent `cs = s.groupby(g).cumsum(); roll = cs - cs.groupby(g).shift(W).fillna(0.0)`. The `.fillna(0.0)` matters: at the first full window the shift runs past the group start and returns NaN, silently dropping one valid point per stock.
++    - CONDITIONAL (masked) correlation / beta are the worst offenders (`downside_beta`, `downside_corr`, `up_capture`, ...): do NOT loop day by day. Build a boolean mask `(mkt < 0) & r.notna()`, zero the invalid entries, compute the six windowed moments (count, sum_r, sum_m, sum_r*m, sum_r^2, sum_m^2) with the cumsum trick, then apply the closed form: `num = Sxy - Sx*Sy/n` with `den = sqrt((Sxx - Sx^2/n) * (Syy - Sy^2/n))` for correlation, or `den = Syy - Sy^2/n` for beta. Keep the result only for full-span windows with `n >= 2`.
++    - The raw data is stored as float32: cast to float64 before cumulative / rolling arithmetic, otherwise cumsum loses precision and conditional correlations can fall outside [-1, 1].
+ 
+ factor_experiment_output_format: |-
+   The output should follow JSON format. The schema is as follows:
+@@ -185,9 +212,12 @@ factor_feedback_generation:
+       3. Final Goal: To continuously accumulate factors that surpass each iteration to maintain the best SOTA.
+     
+     When judging the results:
+-      1. Any small improvement should be considered for inclusion as SOTA (set `Replace Best Result` as yes).
+-      2. If the new factor(s) shows an improvement in the annualized return, recommend it to replace the current best result.
+-      3. Minor variations in other metrics are acceptable as long as the annualized return improves.
++      1. The primary metric is the Calmar Ratio (= annualized_return / |max_drawdown|, both with cost). Prefer the result with the higher Calmar.
++      2. Set `Replace Best Result` as yes ONLY IF BOTH of the following hold:
++         a) Calmar improves (is higher than SOTA), AND
++         b) Hard constraint: max_drawdown (with cost) does NOT worsen by more than 0.03 vs SOTA (i.e. |current_max_drawdown| - |SOTA_max_drawdown| <= 0.03).
++      3. If max_drawdown worsens by more than 0.03, do NOT replace even if Calmar improves. Instead, in "New Hypothesis" suggest ways to reduce drawdown (e.g. lower turnover, add trend/volatility filter, fewer but higher-conviction names).
++      4. IC is only a secondary reference; do NOT use IC as the deciding factor for replacement.
+ 
+     Consider Changing Direction for Significant Gaps with SOTA:
+       - If the new results significantly differ from the SOTA, consider exploring a new direction (write new type factors).
+diff --git a/rdagent/scenarios/qlib/proposal/factor_proposal.py b/rdagent/scenarios/qlib/proposal/factor_proposal.py
+index 5ce9b70..f0a659a 100644
+--- a/rdagent/scenarios/qlib/proposal/factor_proposal.py
++++ b/rdagent/scenarios/qlib/proposal/factor_proposal.py
+@@ -1,9 +1,13 @@
+ import json
+-from typing import List, Tuple
++import os
++import re
++from typing import List, Optional, Tuple
+ 
+ from rdagent.components.coder.factor_coder.factor import FactorExperiment, FactorTask
+ from rdagent.components.proposal import FactorHypothesis2Experiment, FactorHypothesisGen
++from rdagent.core.exception import FactorEmptyError
+ from rdagent.core.proposal import Hypothesis, Scenario, Trace
++from rdagent.log import rdagent_logger as logger
+ from rdagent.scenarios.qlib.experiment.factor_experiment import QlibFactorExperiment
+ from rdagent.scenarios.qlib.experiment.model_experiment import QlibModelExperiment
+ from rdagent.scenarios.qlib.experiment.quant_experiment import QlibQuantScenario
+@@ -11,33 +15,302 @@ from rdagent.utils.agent.tpl import T
+ 
+ QlibFactorHypothesis = Hypothesis
+ 
++# ===========================================================================
++# 因子规整规则（2026-09-24）
++# ===========================================================================
++# 1) 最短回看窗口
++#    LLM 实测爱提 1 日窗口因子（intraday_range_1d / overnight_gap_1d /
++#    close_location_value_1d ...）。这类日内噪声因子 Rank IC 长期贴噪声底
++#    （实测 0.013~0.021）、Calmar 全靠回撤运气、跨会话无法复现，是「概率抽签」
++#    的主要来源之一。故硬性禁止回看窗口 < MIN_FACTOR_WINDOW 个交易日的因子。
++#    可用环境变量 `RDAGENT_MIN_FACTOR_WINDOW` 覆盖（0 = 关闭该规则）。
++# 2) 同族同窗去重
++#    原去重只做「因子名精确匹配」，换个后缀（_v2 / _filtered / _winsor / _scaled）
++#    就能绕过并把同族因子重新塞进池子。这里补一层规范化键去重（见
++#    `normalize_factor_key`），治「换皮绕过」。
++# ===========================================================================
++_ENV_MIN_WINDOW = "RDAGENT_MIN_FACTOR_WINDOW"
++DEFAULT_MIN_FACTOR_WINDOW = 5
++
++# 因子名里的窗口写法：xxx_20d / xxx_5D / xxx_20day。
++# ⚠️ 不能用 \b 收尾：`_20d_v2` 里 d 后面紧跟 `_`，\b 不成立会导致读不出窗口；
++# 改用负向先行断言 (?![a-z0-9])，容忍 `_`/`.`/结尾等分隔符。
++_WINDOW_IN_NAME = re.compile(r"[_\-](\d{1,4})\s*(?:d(?:ays?)?)(?![a-z0-9])", re.IGNORECASE)
++# 公式/描述/变量说明里的窗口写法：window=20 / 20-day / 20 日 / 20 trading days
++_WINDOW_IN_TEXT = re.compile(r"(\d{1,4})\s*(?:d\b|days?\b|日)", re.IGNORECASE)
++
++# 换皮修饰后缀：规范化时剥掉，使 xxx_20d_v2 / xxx_20d_filtered 与 xxx_20d 同键
++_DECOR_SUFFIXES = (
++    "v2", "v3", "v4", "v5", "version2", "version3",
++    "filtered", "winsor", "winsorized", "adjusted", "adj",
++    "scaled", "norm", "normalized", "zscore", "z_score",
++    "smoothed", "smooth", "clipped", "clip", "pct",
++)
++_DECOR_SUFFIX_RE = re.compile(r"_(?:" + "|".join(_DECOR_SUFFIXES) + r")(?:_\d+)?$", re.IGNORECASE)
++
++
++def _conf_min_window() -> int:
++    """配置层默认值（conf.factor_min_window，可用 QLIB_FACTOR_FACTOR_MIN_WINDOW 覆盖）。
++
++    延迟导入避免与 app 层形成循环依赖（与 factor_selector 同做法）。
++    """
++    try:
++        from rdagent.app.qlib_rd_loop.conf import FactorBasePropSetting
++
++        return int(getattr(FactorBasePropSetting(), "factor_min_window", DEFAULT_MIN_FACTOR_WINDOW))
++    except Exception:
++        return DEFAULT_MIN_FACTOR_WINDOW
++
++
++def _min_factor_window() -> int:
++    """当前生效的最短回看窗口（交易日）。
++
++    优先级：env RDAGENT_MIN_FACTOR_WINDOW（临时覆盖） > conf.factor_min_window > 模块默认 5；
++    <=0 表示关闭规则。
++    """
++    raw = os.environ.get(_ENV_MIN_WINDOW)
++    if raw is None or str(raw).strip() == "":
++        return _conf_min_window()
++    try:
++        return int(str(raw).strip())
++    except ValueError:
++        logger.warning(f"[min-window] {_ENV_MIN_WINDOW}={raw!r} 非法，改用配置层默认 {_conf_min_window()}")
++        return _conf_min_window()
++
++
++def extract_factor_windows(task: FactorTask) -> List[int]:
++    """提取因子回看窗口（交易日）。因子名优先（权威），名字里读不到才退回公式/描述/变量说明。
++
++    读不出窗口时返回 []（调用方应放行，不要误杀 roe_level / amihud_illiq 这类无窗口因子）。
++    """
++    name_windows = {int(m) for m in _WINDOW_IN_NAME.findall(getattr(task, "factor_name", "") or "")}
++    if name_windows:
++        return sorted(name_windows)
++    text = " ".join(
++        [
++            str(getattr(task, "factor_formulation", "") or ""),
++            str(getattr(task, "factor_description", "") or ""),
++            json.dumps(getattr(task, "variables", None) or {}, ensure_ascii=False),
++        ]
++    )
++    return sorted({int(m) for m in _WINDOW_IN_TEXT.findall(text)})
++
++
++def dedup_tasks(tasks: List[FactorTask], hist_names: set) -> Tuple[List[FactorTask], List[tuple]]:
++    """L1 硬拦：剔除与本会话（trace.hist）已用因子重复的提案。
++
++    三层判定（越前越硬）：
++      1) 精确同名
++      2) 规范化键（同名归一 / 换皮 `_v2` `_filtered`）
++      3) 规范键（同义词表：`ILLIQ_20D` == `amihud_illiquidity_20d`）；读不出窗口时按家族兜底
++    另外拦「本轮内自我重复」。返回 (保留的 tasks, 被剔除的 [(因子名, 原因)])。
++
++    注意：本层只看**本会话**历史。跨会话历史不在此层（L2 需理由 / L3 台账驱动，待实施）。
++    """
++    hist_keys = {normalize_factor_key(n) for n in hist_names}
++    hist_canon = {canonical_dedup_key(n) for n in hist_names}
++    hist_canon_fams = {canonical_family_key(n) for n in hist_names}
++    unique_tasks: List[FactorTask] = []
++    dropped: List[tuple] = []
++    seen_keys: set = set()
++    seen_canon: set = set()
++    for task in tasks:
++        norm_key = normalize_factor_key(task.factor_name)
++        windows = extract_factor_windows(task)
++        canon = canonical_dedup_key(task.factor_name, windows)
++        canon_fam = canonical_family_key(task.factor_name)
++        if task.factor_name in hist_names:
++            dropped.append((task.factor_name, "精确同名（本会话已挖过）"))
++            continue
++        if norm_key in hist_keys:
++            dropped.append((task.factor_name, f"换皮重复（规范化键 {norm_key} 已在本会话用过）"))
++            continue
++        if canon in hist_canon:
++            dropped.append((task.factor_name, f"同义重复（规范键 {canon} 已在本会话用过）"))
++            continue
++        if not windows and canon_fam in hist_canon_fams:
++            dropped.append((task.factor_name, f"同家族无窗口兜底（家族 {canon_fam} 已在本会话探索过）"))
++            continue
++        if norm_key in seen_keys or canon in seen_canon:
++            dropped.append((task.factor_name, f"本轮内重复（规范键 {canon}）"))
++            continue
++        seen_keys.add(norm_key)
++        seen_canon.add(canon)
++        unique_tasks.append(task)
++    for name, why in dropped:
++        logger.info(f"[factor-dedup] 剔除 {name}：{why}")
++    return unique_tasks, dropped
++
++
++def filter_by_min_window(tasks: List[FactorTask], min_window: int) -> Tuple[List[FactorTask], List[tuple]]:
++    """剔除回看窗口 < min_window 交易日的因子。返回 (保留列表, 被剔除的 (因子名, 窗口) 列表)。
++
++    只否决「能明确读出窗口且过短」的因子；读不出窗口的一律放行，避免误杀。
++    """
++    if min_window <= 0:
++        return list(tasks), []
++    kept: List[FactorTask] = []
++    rejected: List[tuple] = []
++    for t in tasks:
++        ws = extract_factor_windows(t)
++        if ws and min(ws) < min_window:
++            rejected.append((t.factor_name, ws))
++        else:
++            kept.append(t)
++    return kept, rejected
++
++
++def normalize_factor_key(name: str) -> str:
++    """把因子名规范化成「同族同窗」键：剥掉换皮修饰后缀/版本号 + 统一小写。
++
++    pv_corr_20d / pv_corr_20d_v2 / pv_corr_20d_filtered → pv_corr_20d
++    注意：窗口不同的仍是不同的键（pv_corr_10d != pv_corr_20d）；跨窗口的「同族」避重
++    走 prompt 引导，不在这里硬砍，避免把合理的窗口探索也一并封死。
++    """
++    k = str(name or "").strip().lower()
++    prev = None
++    while prev != k:  # 连续后缀一次剥干净（如 xxx_20d_v2_filtered）
++        prev = k
++        k = _DECOR_SUFFIX_RE.sub("", k)
++    return re.sub(r"_+", "_", k).strip("_")
++
++
++def factor_family_key(name: str) -> str:
++    """因子「家族」键 = 规范化键去掉窗口 token（用于提示词里汇总已探索家族）。
++
++    pv_corr_20d / pv_corr_10d → pv_corr；reversal_5d_vol_scaled → reversal_vol_scaled。
++    ⚠️ 只做「字面」归一（去窗口/去装饰后缀），不做同义词归并 —— 需要同义词口径
++    请用 `canonical_family_key()`。
++    """
++    k = normalize_factor_key(name)
++    k = _WINDOW_IN_NAME.sub("", k)
++    k = re.sub(r"(\d{1,4})\s*(?:d(?:ays?)?)(?![a-z0-9])", "", k, flags=re.IGNORECASE)
++    return re.sub(r"_+", "_", k).strip("_")
++
++
++# ===========================================================================
++# 因子同义词表（2026-09-24，P0-3 根治）
++# ---------------------------------------------------------------------------
++# 问题：`factor_family_key` 只比字面。LLM 只要换个叫法，同一个因子就能再挖一遍：
++#   历史 ILLIQ_20D      → 本轮 amihud_illiquidity_20d
++#   历史 DOWNBETA_60D   → 本轮 downside_beta_60d
++#   历史 MOM_5D         → 本轮 momentum_5d / price_momentum_5d
++# 解法：把「同一概念的不同写法（缩写/全称/历史大写/同族拼写）」归到一个规范家族。
++#
++# 规则用 `re.fullmatch` 整串匹配（越具体越靠前），不匹配就退回「逐 token 别名」。
++# 新增别名时只改这一张表即可（配置化，不散落在逻辑里）。
++# ===========================================================================
++_FAMILY_ALIAS_RULES: tuple[tuple[str, str], ...] = (
++    # 流动性：Amihud 非流动性
++    (r"(?:amihud_?)?(?:illiq|illiquidity)(?:_?ratio)?", "illiq"),
++    # 波动率：vol / volatility / realized_vol / realized_volatility / rv / std / sigma
++    (r"(?:realized_?|real_?)?(?:vol|volatility)|rv|std(?:_dev(?:iation)?)?|sigma", "volatility"),
++    # 动量（注意 fullmatch：volume_weighted_momentum 不会被归到这里）
++    (r"(?:price_?|ret(?:urn)?_?)?(?:mom|momentum)", "momentum"),
++    # 反转（含 mean reversion）
++    (r"(?:mean_?)?(?:rev|reversal|reversion|mean_?reversal)", "reversal"),
++    # 收盘位置（CLV）
++    (r"clv|close_?loc(?:ation)?(?:_value)?", "clv"),
++    (r"skew(?:ness)?", "skew"),
++    (r"kurt(?:osis)?", "kurt"),
++    # 价量相关（pv_corr / return_volume_corr / price_volume_corr / corr_pv ...）
++    (r"(?:pv|price_?vol(?:ume)?|ret(?:urn)?_?vol(?:ume)?)_?corr(?:elation)?", "pv_corr"),
++    (r"corr_?(?:pv|price_?vol(?:ume)?|ret(?:urn)?_?vol(?:ume)?)", "pv_corr"),
++    # 量比 / 换手
++    (r"vol(?:ume)?_?ratio|volratio|turnover_?ratio", "vol_ratio"),
++    (r"turnover(?:_rate)?|turn", "turnover"),
++    # 量价趋势（VPT / PVT 同一回事：Price-Volume Trend）——注意 divergence 是另一个家族，不会命中
++    (r"pvt|vpt|volume_?price_?trend|price_?volume_?trend", "vpt"),
++    # VWAP 偏离（vwap_dev / vwap_deviation / vwap_deviation_ratio 同一回事）
++    (r"vwap_?(?:dev|deviation|deviat(?:ion)?_?ratio)(?:_?ratio)?", "vwap_dev"),
++    # 下行相关系数 / 下行 beta（历史大写 DOWNBETA / DOWNCORR）
++    (r"down(?:corr|side_?corr(?:elation)?)", "downcorr"),
++    (r"down(?:beta|side_?beta)", "downside_beta"),
++    # 波动缩放反转（reversal_vol_scaled / volatility_scaled_reversal 同一东西）
++    (r"(?:vol(?:atility)?_?scaled_?reversal|reversal_?vol(?:atility)?_?scaled)", "vol_scaled_reversal"),
++    # 价量背离（volume_price_divergence / price_volume_trend_divergence 同一概念）
++    (r"(?:pv|price_?volume|volume_?price)_?(?:trend_?)?divergence", "pv_divergence"),
++    # 成交额
++    (r"amt|amount|dollar_?volume", "amount"),
++)
++_FAMILY_ALIAS_COMPILED: tuple[tuple[re.Pattern, str], ...] = tuple(
++    (re.compile(rf"^(?:{pat})$", re.IGNORECASE), canon) for pat, canon in _FAMILY_ALIAS_RULES
++)
++
++# 逐 token 别名（整串规则不命中时用；只做精确 token 替换，不做子串替换，避免误伤）
++_FAMILY_TOKEN_ALIAS: dict[str, str] = {
++    "illiq": "illiq",
++    "illiquidity": "illiq",
++    "vol": "volatility",
++    "realized_vol": "volatility",
++    "ret": "return",
++    "mom": "momentum",
++    "rev": "reversal",
++    "skewness": "skew",
++    "kurtosis": "kurt",
++}
++
++
++def canonical_family_key(name: str) -> str:
++    """因子「规范家族」键（含同义词归并）。
++
++    ILLIQ_20D / amihud_illiq_5d / amihud_illiquidity_20d  → illiq
++    DOWNBETA_60D / downside_beta_20d                      → downside_beta
++    reversal_10d_vol_scaled_60d / volatility_scaled_reversal_5d → vol_scaled_reversal
++
++    先整串匹配同义词规则；不命中则逐 token 归一后拼回。这是去重与「家族清单」的统一口径。
++    """
++    k = factor_family_key(name)
++    if not k:
++        return k
++    for rx, canon in _FAMILY_ALIAS_COMPILED:
++        if rx.match(k):
++            return canon
++    toks = [_FAMILY_TOKEN_ALIAS.get(t, t) for t in k.split("_")]
++    return "_".join(t for t in toks if t)
++
++
++def windows_from_name(name: str) -> List[int]:
++    """从因子名里读回看窗口（无窗口返回 []）。用于历史因子名（拿不到 FactorTask 时）。"""
++    return sorted({int(m) for m in _WINDOW_IN_NAME.findall(str(name or ""))})
++
++
++def canonical_dedup_key(name: str, windows: Optional[List[int]] = None) -> str:
++    """跨命名去重键 = 规范家族 + 窗口集合。
++
++    amihud_illiquidity_20d 与 历史 ILLIQ_20D  → 同为 "illiq@20"，命中拦截；
++    而 illiq_60d → "illiq@60"，仍算窗口探索，放行（与 factor_proposal 既有窗口策略一致）。
++    """
++    ws = windows_from_name(name) if windows is None else windows
++    ws = sorted({int(w) for w in ws})
++    return f"{canonical_family_key(name)}@{','.join(str(w) for w in ws)}"
++
+ 
+ class QlibFactorHypothesisGen(FactorHypothesisGen):
+     def __init__(self, scen: Scenario) -> Tuple[dict, bool]:
+         super().__init__(scen)
+ 
+     def prepare_context(self, trace: Trace) -> Tuple[dict, bool]:
+-        hypothesis_and_feedback = (
+-            T("scenarios.qlib.prompts:hypothesis_and_feedback").r(
+-                trace=trace,
++        # 2026-09-27 修：过滤 experiment 为 None 的历史条目（跳圈产物）。
++        # 历史遗留的污染会话（hist 含 None）此前会在渲染 {{ experiment.hypothesis }} 时 UndefinedError 崩掉。
++        valid_hist = [t for t in trace.hist if t is not None and t[0] is not None]
++        if len(valid_hist) > 0:
++            clean_trace = Trace(trace.scen)
++            clean_trace.hist = valid_hist
++            hypothesis_and_feedback = T("scenarios.qlib.prompts:hypothesis_and_feedback").r(trace=clean_trace)
++            last_hypothesis_and_feedback = T("scenarios.qlib.prompts:last_hypothesis_and_feedback").r(
++                experiment=valid_hist[-1][0], feedback=valid_hist[-1][1]
+             )
+-            if len(trace.hist) > 0
+-            else "No previous hypothesis and feedback available since it's the first round."
+-        )
+-        last_hypothesis_and_feedback = (
+-            T("scenarios.qlib.prompts:last_hypothesis_and_feedback").r(
+-                experiment=trace.hist[-1][0], feedback=trace.hist[-1][1]
+-            )
+-            if len(trace.hist) > 0
+-            else "No previous hypothesis and feedback available since it's the first round."
+-        )
++        else:
++            hypothesis_and_feedback = "No previous hypothesis and feedback available since it's the first round."
++            last_hypothesis_and_feedback = "No previous hypothesis and feedback available since it's the first round."
+ 
+         context_dict = {
+             "hypothesis_and_feedback": hypothesis_and_feedback,
+             "last_hypothesis_and_feedback": last_hypothesis_and_feedback,
+             "RAG": (
+                 "Try the easiest and fastest factors to experiment with from various perspectives first."
+-                if len(trace.hist) < 15
++                if len(valid_hist) < 15
+                 else "Now, you need to try factors that can achieve high IC (e.g., machine learning-based factors)."
+             ),
+             "hypothesis_output_format": T("scenarios.qlib.prompts:factor_hypothesis_output_format").r(),
+@@ -59,6 +332,35 @@ class QlibFactorHypothesisGen(FactorHypothesisGen):
+ 
+ 
+ class QlibFactorHypothesis2Experiment(FactorHypothesis2Experiment):
++    @staticmethod
++    def _collect_used_factor_names(trace: Trace) -> list[str]:
++        """收集历史所有实验里用过的因子名（含失败、含未进 SOTA 的），用于去重与提示。"""
++        used: set[str] = set()
++        for t in trace.hist:
++            if isinstance(t[0], FactorExperiment):
++                for sub_task in t[0].sub_tasks:
++                    used.add(sub_task.factor_name)
++        return sorted(used)
++
++    @staticmethod
++    def _collect_used_factor_families(trace: Trace) -> dict[str, list[str]]:
++        """收集历史已用因子的「家族 → 因子名示例」。
++
++        2026-09-24（P0-5）：原提示只给一串因子名，LLM 看到 200+ 名字后依旧反复回
++        到同几个家族，只是换个窗口/后缀。改成按家族汇总，让「已探索空间」紧凑可见。
++
++        2026-09-24 晚（P0-3 根治）：家族口径改用 `canonical_family_key`（含同义词归并），
++        使 ILLIQ_20D 与 amihud_illiquidity_20d 在清单里合并成同一个 illiq，
++        不再给 LLM 「换个叫法就是新方向」的错觉。
++        """
++        fams: dict[str, list[str]] = {}
++        for name in QlibFactorHypothesis2Experiment._collect_used_factor_names(trace):
++            fam = canonical_family_key(name)
++            fams.setdefault(fam, [])
++            if name not in fams[fam]:
++                fams[fam].append(name)
++        return fams
++
+     def prepare_context(self, hypothesis: Hypothesis, trace: Trace) -> Tuple[dict | bool]:
+         if isinstance(trace.scen, QlibQuantScenario):
+             scenario = trace.scen.get_scenario_all_desc(action="factor")
+@@ -72,6 +374,9 @@ class QlibFactorHypothesis2Experiment(FactorHypothesis2Experiment):
+         else:
+             specific_trace = Trace(trace.scen)
+             for i in range(len(trace.hist) - 1, -1, -1):
++                # 2026-09-27 修：跳过跳圈产生的 None 实验（历史遗留污染），避免 None.hypothesis 崩
++                if trace.hist[i][0] is None:
++                    continue
+                 if not hasattr(trace.hist[i][0].hypothesis, "action") or trace.hist[i][0].hypothesis.action == "factor":
+                     specific_trace.hist.insert(0, trace.hist[i])
+             if len(specific_trace.hist) > 0:
+@@ -82,6 +387,33 @@ class QlibFactorHypothesis2Experiment(FactorHypothesis2Experiment):
+             else:
+                 hypothesis_and_feedback = "No previous hypothesis and feedback available."
+ 
++        # 2026-10-09（A 修正）：不再把「历史因子名清单」原文贴进提示词。
++        # 清单里全是合法的因子名，LLM 常直接照抄其中一个（只改窗口尾缀）→ 必撞 L1 精确同名；
++        # 且重试（wait_retry）用同一 prompt 复读，连撞 6 次 → 空圈跳圈、零产物
++        # （见 rd_20261009_181951 / Loop 41 Skip）。改为只给数量，不给可复制的名字；
++        # 精确同名仍由 convert_response 的 L1 去重兜底，防重能力不损失。
++        used_factor_names = self._collect_used_factor_names(trace)
++        if used_factor_names:
++            hypothesis_and_feedback += (
++                f"\n\n⚠️ 历史轮次已提出过 {len(used_factor_names)} 个因子（明细刻意不列出，避免被照抄）。"
++                "严禁重复使用任何已出现过的因子名，也严禁只换窗口/后缀的换皮做法。"
++            )
++
++        # 2026-09-24（P0-5）：额外给一份「家族级」已探索清单。按家族汇总后能直接看出哪些方向已被
++        # 反复挖过，引导它去开拓清单外的家族（每轮多因子时至少覆盖 2 个家族）。
++        # 2026-10-09：家族行同样只给「家族名 + 数量」，不再附示例因子名（同上，避免照抄）。
++        used_families = self._collect_used_factor_families(trace)
++        if used_families:
++            family_lines = []
++            for fam, names in sorted(used_families.items(), key=lambda kv: (-len(kv[1]), kv[0])):
++                family_lines.append(f"  - {fam or '(无名)'}（已挖 {len(names)} 个）")
++            hypothesis_and_feedback += (
++                "\n\n⚠️ 历史已探索的因子家族汇总（共 %d 个家族）：\n" % len(used_families)
++                + "\n".join(family_lines)
++                + "\n  说明：同一家族换窗口/换后缀不算新因子；请优先开拓上表之外的家族，"
++                "且本轮若提多个因子，至少覆盖 2 个不同家族。"
++            )
++
+         return {
+             "target_hypothesis": str(hypothesis),
+             "scenario": scenario,
+@@ -113,20 +445,53 @@ class QlibFactorHypothesis2Experiment(FactorHypothesis2Experiment):
+             t[0] for t in trace.hist if t[1] and isinstance(t[0], FactorExperiment)
+         ]
+ 
+-        unique_tasks = []
+-        for task in tasks:
+-            duplicate = False
+-            for based_exp in exp.based_experiments:
+-                if isinstance(based_exp, QlibModelExperiment):
+-                    continue
+-                for sub_task in based_exp.sub_tasks:
+-                    if task.factor_name == sub_task.factor_name:
+-                        duplicate = True
+-                        break
+-                if duplicate:
+-                    break
+-            if not duplicate:
+-                unique_tasks.append(task)
+-
+-        exp.tasks = unique_tasks
++        # ── 新规（2026-09-24）：最短回看窗口 ────────────────────────────────
++        # 剔除 < min_window 个交易日的窗口因子；若全被剔除，主动抛 FactorEmptyError
++        # 让上游 @wait_retry(retry_n=5) 重新提案（与撞名保护同一机制）。
++        min_window = _min_factor_window()
++        tasks, rejected_window = filter_by_min_window(tasks, min_window)
++        if rejected_window:
++            logger.info(
++                f"[min-window] 剔除回看窗口 < {min_window} 个交易日的因子："
++                f"{[(n, ws) for n, ws in rejected_window]}"
++            )
++        if not tasks:
++            logger.warning(f"[min-window] 本轮提案因子窗口全部 < {min_window} 日，触发重新提案")
++            raise FactorEmptyError(
++                f"本轮提案因子的回看窗口全部小于 {min_window} 个交易日，禁止使用过短窗口的噪声因子，"
++                f"请改用 >= {min_window} 日的窗口后重新提案。"
++            )
++
++        # 去重（2026-09-09 精确名 + 2026-09-24 同族同窗规范化键 + 2026-09-24 同义词规范键）
++        # 收集全部历史因子名（含失败，不再只收进过 SOTA 的）。
++        hist_names = set(self._collect_used_factor_names(trace))
++        # L1 硬拦：剔除与本会话（trace.hist）已挖过的因子（精确同名 / 换皮 / 同义词 / 同族无窗口）。
++        # 判定逻辑已抽到模块级 dedup_tasks()（可单测）；跨会话历史不在本层（L2/L3 待实施）。
++        unique_tasks, _dedup_dropped = dedup_tasks(tasks, hist_names)
++
++        # P0-5 软约束：一轮多因子却全挤在同一家族，只告警不拦截（拦截会造成重提风暴）。
++        families = {canonical_family_key(t.factor_name) for t in unique_tasks}
++        if len(unique_tasks) >= 2 and len(families) < 2:
++            logger.warning(
++                f"[factor-family] 本轮 {len(unique_tasks)} 个因子全属同一家族 {sorted(families)}，"
++                f"探索多样性不足（建议每轮至少覆盖 2 个不同家族）。"
++            )
++
++        # 2026-09-13：空任务保护。
++        # 若去重后无一幸存（本轮提案因子名与历史全部重复），交给 CoSTEER 就是 0 个任务，
++        # 会被立即判定「全部完成/失败」并静默跳圈，产出空白结果（见 rd_20260913_183329）。
++        # 主动抛 FactorEmptyError：上游 convert() 带 @wait_retry(retry_n=5) 会自动重新提案
++        # （重新调用 LLM 生成因子名）；全部重试仍撞名才跳圈，且日志带上明确原因。
++        if len(unique_tasks) == 0:
++            dup_names = [task.factor_name for task in tasks]
++            logger.warning(f"本轮提案因子全部与历史重复/被规则剔除，触发重新提案：{dup_names}")
++            raise FactorEmptyError(
++                f"本轮提案因子全部与历史重复或已被规整规则剔除（共 {len(dup_names)} 个：{dup_names}），请更换新因子名。"
++            )
++
++        # 关键修复（2026-09-09）：之前写的是 exp.tasks（死属性，全代码库无人读取），
++        # 开发者 CoSTEER 和 runner 实际读的是 exp.sub_tasks，导致去重从未生效。
++        # 必须把去重结果写回 sub_tasks，并同步 sub_workspace_list 长度。
++        exp.sub_tasks = unique_tasks
++        exp.sub_workspace_list = [None] * len(unique_tasks)
+         return exp
+diff --git a/rdagent/utils/workflow/misc.py b/rdagent/utils/workflow/misc.py
+index 24b450a..65079b9 100644
+--- a/rdagent/utils/workflow/misc.py
++++ b/rdagent/utils/workflow/misc.py
+@@ -6,10 +6,23 @@ ASpecificRet = TypeVar("ASpecificRet")
+ 
+ 
+ def wait_retry(
+-    retry_n: int = 3, sleep_time: int = 1, transform_args_fn: Callable[[tuple, dict], tuple[tuple, dict]] | None = None
++    retry_n: int = 3,
++    sleep_time: int = 1,
++    transform_args_fn: Callable[[tuple, dict], tuple[tuple, dict]] | None = None,
++    on_retry: Callable[[int, Exception], None] | None = None,
++    on_finish: Callable[[], None] | None = None,
+ ) -> Callable[[Callable[..., ASpecificRet]], Callable[..., ASpecificRet]]:
+     """Decorator to wait and retry the function for retry_n times.
+ 
++    Args:
++        retry_n: 最多重试次数（首次失败后再试 retry_n 次）。
++        sleep_time: 每次重试前的等待秒数。
++        transform_args_fn: 重试前改写调用的 args/kwargs（例如把失败原因追加进 prompt）。
++        on_retry: 第 n 次重试**之前**回调 ``on_retry(attempt, exception)``（attempt 从 1 开始）。
++            2026-10-09 新增：用于「重试升温」等按次递增的策略。
++        on_finish: 无论成功返回还是重试耗尽抛错，都会在出口处回调一次（用于复位
++            on_retry 设置的临时状态，避免泄漏）。
++
+     Example:
+     >>> import time
+     >>> @wait_retry(retry_n=2, sleep_time=1)
+@@ -36,15 +49,23 @@ def wait_retry(
+         def wrapper(*args: Any, **kwargs: Any) -> ASpecificRet:
+             for i in range(retry_n + 1):
+                 try:
+-                    return f(*args, **kwargs)
++                    ret = f(*args, **kwargs)
++                    if on_finish is not None:
++                        on_finish()
++                    return ret
+                 except Exception as e:
+                     print(f"Error: {e}")
+                     time.sleep(sleep_time)
+                     if i == retry_n:
++                        if on_finish is not None:
++                            on_finish()
+                         raise
+                     # Update args and kwargs using the transform function if provided.
+                     if transform_args_fn is not None:
+                         args, kwargs = transform_args_fn(args, kwargs)
++                    # 重试前的回调（2026-10-09：重试升温）。
++                    if on_retry is not None:
++                        on_retry(i + 1, e)
+             else:
+                 # just for passing mypy CI.
+                 return f(*args, **kwargs)

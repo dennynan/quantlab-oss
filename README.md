@@ -99,6 +99,7 @@ quantlab-oss/
 ├── scripts/        真实行情拉取 / Qlib 数据构建 / 标的池
 ├── docker/         Dockerfile 与 nginx 配置
 ├── docs/           架构说明与截图
+├── patches/        RD-Agent「挖因子」升级补丁（见下）
 └── docker-compose.yml
 ```
 
@@ -107,6 +108,19 @@ quantlab-oss/
 「自动因子挖掘」由微软的第三方框架 [RD-Agent](https://github.com/microsoft/RD-Agent) 驱动——
 它**不是本项目代码**，需在你本机单独安装并配好（任何部署方式都如此，与本项目是否开源无关）；
 未配置时该模块只给出清晰提示（含缺哪一项），不影响其余功能。
+
+### ⬆️ 因子挖掘升级补丁（建议打上）
+
+本项目在该框架**挖因子这一环**做了成体系的升级：**入库前重选（贪心前向 + 显著性门槛）、相关性剪枝、
+判重归一、同族窗口上限、入库前正交化、提案规整（最短窗口 / 去重 / 重试升温）、棘轮治理（基线改会话历史最优 + 硬闸 + 停滞重启）**。
+
+这些升级以补丁形式随本仓库提供：
+
+- 目录：[`patches/rdagent-factor-upgrades/`](./patches/rdagent-factor-upgrades/)
+- 一键应用：`cd patches/rdagent-factor-upgrades && ./apply.sh --clone`
+- 补丁针对上游 `v1.0.0`，已验证可干净应用
+
+> 不打补丁也能跑，只是跑的是**原版 RD-Agent**，没有上述升级。
 
 ### 工作目录隔离（重要）
 
@@ -122,7 +136,13 @@ RD-Agent 的 workspace / 日志 / pickle 缓存体积很大（单次挖掘可达
 
 ### 配置步骤
 
-1. 在一个独立 conda 环境里装好 rdagent（例如 `conda create -n rdagent_oss ...; pip install -e /path/to/RD-Agent`），
+1. 在一个独立 conda 环境里装好 rdagent：
+   ```bash
+   # 拉取上游 v1.0.0 并打上本项目的挖因子升级补丁
+   cd patches/rdagent-factor-upgrades && ./apply.sh --clone && cd -
+   conda create -n rdagent_oss python=3.11 -y && conda activate rdagent_oss
+   pip install -e ./patches/rdagent-factor-upgrades/RD-Agent
+   ```
    建议**不要**与其他项目的环境共用，避免版本互相干扰。
 2. 在 `<RDAGENT_HOME>/.env` 写入 LLM 凭证等（参考 `.env.example` 的 RD-Agent 段）；
    若环境名不是 `rdagent`，在该文件里设 `CONDA_ENV_NAME=<你的环境名>`。
